@@ -48,6 +48,8 @@ double getRoot(double (*f)(double), double (*df)(double), double initVal);
 int f_and_x(double x[], double f[], int n, int fromx, int LastItem);
 void bigexp(double lnx, double *a, double *b);
 void SetSeed (int seed, int PrintSeed);
+void GetRNGstate(unsigned int state[4]);
+void SetRNGstate(unsigned int state[4]);
 double rndu (void);
 void rndu_vector (double r[], int n);
 void randorder(int order[], int n, int space[]);

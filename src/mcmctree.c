@@ -74,6 +74,9 @@ double InfinitesitesClock(double *FixedDs);
 double Infinitesites(FILE *fout);
 int collectx(FILE* fout, double x[]);
 int MCMC(FILE* fout);
+int FileExists(char *filename);
+int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastgen, int *nskipped);
+int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, int *lastgen);
 int LabelOldCondP(int spnode);
 int UpdateTimes(double *lnL, double steplength[], char accept[]);
 int UpdateTimesClock23(double *lnL, double steplength[], char accept[]);
@@ -804,12 +807,13 @@ void FreeMem(void)
 }
 
 
-int SaveMCMCstate(char *filename, int ir, double lnpR, double lnL)
+int SaveMCMCstate(char *filename, int ir, double lnpR, double lnL, double nround, double mx[], double mlnL)
 {
 /* This saves stree, the gene trees, and the MCMC step lengths.
 */
    FILE *f = (FILE*)fopen(filename, "wb");
    int i,j, s = stree.nspecies, g = data.ngene, g1 = g + (data.rgeneprior == 1);
+   unsigned int rngstate[4];
    double *tmp = (double*)malloc((s*2-1)*sizeof(double));
 
    printf("\n\t\tSaving MCMC state to %s... ", filename);
@@ -837,18 +841,25 @@ int SaveMCMCstate(char *filename, int ir, double lnpR, double lnL)
    fwrite(mcmc.steplength, mcmc.nsteplength * sizeof(double), 1, f);
    fwrite(&lnpR, sizeof(double), 1, f);
    fwrite(&lnL, sizeof(double), 1, f);
+   GetRNGstate(rngstate);
+   fwrite(rngstate, 4 * sizeof(unsigned int), 1, f);
+   fwrite(&nround, sizeof(double), 1, f);
+   fwrite(mx, com.np * sizeof(double), 1, f);
+   fwrite(&mlnL, sizeof(double), 1, f);
+   fwrite(mcmc.Pjump, mcmc.nsteplength * sizeof(double), 1, f);
    fclose(f);
    free(tmp);
    printf("iteration %6d: lnpR = %.2f lnL = %.2f\n", ir, lnpR, lnL);
    return(0);
 }
 
-int ReadMCMCstate(char *filename)
+int ReadMCMCstate(char *filename, double *nround, double mx[], double *mlnL)
 {
 /* This reads the MCMC state saved earlier.
 */
    FILE *f = (FILE*)fopen(filename, "rb");
    int ir, i, j, s = stree.nspecies, g = data.ngene, g1 = g + (data.rgeneprior == 1);
+   unsigned int rngstate[4];
    double lnpR = 0, lnL = 0, *tmp = (double*)malloc((s * 2 - 1) * sizeof(double));
 
    printf("\nReading MCMC state from %s...\n", filename);
@@ -876,13 +887,172 @@ int ReadMCMCstate(char *filename)
    fread(mcmc.steplength, mcmc.nsteplength*sizeof(double), 1, f);
    fread(&lnpR, sizeof(double), 1, f);
    fread(&lnL, sizeof(double), 1, f);
+   if (fread(rngstate, 4 * sizeof(unsigned int), 1, f) == 1) {
+      SetRNGstate(rngstate);
+      printf("Random number state restored from checkpoint.\n");
+      if (nround && mx && fread(nround, sizeof(double), 1, f) == 1
+         && fread(mx, com.np * sizeof(double), 1, f) == 1) {
+         printf("Running means restored from checkpoint.\n");
+         if (mlnL && fread(mlnL, sizeof(double), 1, f) == 1
+            && fread(mcmc.Pjump, mcmc.nsteplength * sizeof(double), 1, f) == 1)
+            printf("Progress statistics restored from checkpoint.\n");
+      }
+   }
    fclose(f);
    free(tmp);
    printf("lnpR = %.6f lnL = %.6f\n", lnpR, lnL);
 
-   return(0);
+   return(ir);
 }
 
+int FileExists(char *filename)
+{
+   FILE *f = (FILE*)fopen(filename, "rb");
+
+   if (f == NULL) return(0);
+   fclose(f);
+   return(1);
+}
+
+int CountFields(char line[])
+{
+   int n = 0, infield = 0;
+   char *p;
+
+   for (p = line; *p; p++) {
+      if (isspace(*p)) infield = 0;
+      else if (!infield) {
+         n++;
+         infield = 1;
+      }
+   }
+   return(n);
+}
+
+int FirstFieldIsNumber(char line[])
+{
+   char *p = line, *endp;
+
+   while (*p && isspace(*p)) p++;
+   if (*p == '\0') return(0);
+   strtod(p, &endp);
+   return(endp > p);
+}
+
+int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastgen, int *nskipped)
+{
+   FILE *fin = (FILE*)fopen(filename, "r");
+   int lline = 10000000, n = 0, nline = 0, nf, has_header = 0, igen = 0, skipped = 0;
+   char firstfield[64], *line;
+
+   if (fin == NULL) zerror("mcmcfile open error");
+   if ((line = (char*)malloc(lline * sizeof(char))) == NULL)
+      zerror("oom line in CountMCMCSamples");
+
+   while (fgets(line, lline, fin)) {
+      nf = CountFields(line);
+      if (nf == 0) continue;
+      nline++;
+      if (nline == 1 && !FirstFieldIsNumber(line)) {
+         has_header = 1;
+         sscanf(line, "%63s", firstfield);
+         if (strcmp(firstfield, "Gen"))
+            zerror("mcmcfile header does not start with Gen; refusing to append");
+         if (nf != expected_fields) {
+            printf("\nHeader in %s has %d fields, while this run expects %d.\n",
+               filename, nf, expected_fields);
+            zerror("mcmcfile does not match the current analysis");
+         }
+         continue;
+      }
+      if (!has_header && nline == 1)
+         zerror("mcmcfile has no header; refusing to append");
+      if (nf != expected_fields) {
+         printf("\nLine %d in %s has %d fields, while this run expects %d.\n",
+            nline, filename, nf, expected_fields);
+         zerror("mcmcfile does not match the current analysis");
+      }
+      if (sscanf(line, "%d", &igen) != 1)
+         zerror("cannot read generation number in mcmcfile");
+      if (maxgen <= 0 || igen <= maxgen) {
+         n++;
+         if (lastgen) *lastgen = igen;
+      }
+      else
+         skipped++;
+   }
+   fclose(fin);
+   free(line);
+   if (nline == 0)
+      zerror("mcmcfile is empty; refusing to append");
+   if (nskipped) *nskipped = skipped;
+
+   return(n);
+}
+
+int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, int *lastgen)
+{
+   FILE *fin, *fout;
+   int lline = 10000000, n = 0, nline = 0, nf, has_header = 0, igen = 0, skipped = 0;
+   char firstfield[64], tmpfile[4096], bakfile[4096], *line;
+
+   snprintf(tmpfile, sizeof(tmpfile), "%s.tmp", filename);
+   snprintf(bakfile, sizeof(bakfile), "%s.before-resume-%ld", filename, (long)time(NULL));
+
+   fin = (FILE*)fopen(filename, "r");
+   fout = (FILE*)fopen(tmpfile, "w");
+   if (fin == NULL || fout == NULL)
+      zerror("mcmcfile trim file open error");
+   if ((line = (char*)malloc(lline * sizeof(char))) == NULL)
+      zerror("oom line in TrimMCMCFileToGeneration");
+
+   while (fgets(line, lline, fin)) {
+      nf = CountFields(line);
+      if (nf == 0) continue;
+      nline++;
+      if (nline == 1 && !FirstFieldIsNumber(line)) {
+         has_header = 1;
+         sscanf(line, "%63s", firstfield);
+         if (strcmp(firstfield, "Gen"))
+            zerror("mcmcfile header does not start with Gen; refusing to trim");
+         if (nf != expected_fields)
+            zerror("mcmcfile does not match the current analysis");
+         fputs(line, fout);
+         continue;
+      }
+      if (!has_header && nline == 1)
+         zerror("mcmcfile has no header; refusing to trim");
+      if (nf != expected_fields)
+         zerror("mcmcfile does not match the current analysis");
+      if (sscanf(line, "%d", &igen) != 1)
+         zerror("cannot read generation number in mcmcfile");
+      if (igen <= maxgen) {
+         fputs(line, fout);
+         n++;
+         if (lastgen) *lastgen = igen;
+      }
+      else
+         skipped++;
+   }
+   fclose(fin);
+   fclose(fout);
+   free(line);
+
+   if (skipped == 0) {
+      remove(tmpfile);
+      return(n);
+   }
+
+   if (rename(filename, bakfile))
+      zerror("failed to back up mcmcfile before trimming");
+   if (rename(tmpfile, filename))
+      zerror("failed to install trimmed mcmcfile");
+   printf("\nAutomatic resume: ignored %d samples after checkpoint generation %d.\n",
+      skipped, maxgen);
+   printf("The original mcmcfile was saved as %s.\n", bakfile);
+
+   return(n);
+}
 
 int UseLocus(int locus, int copyconP, int setModel, int setSeqName)
 {
@@ -4460,6 +4630,11 @@ int MCMC(FILE* fout)
 {
    FILE *fmcmc = NULL;
    int nxpr[2] = { 6, 2 }, i, j, k, ir, g = data.ngene;
+   int autoresume = 0, existing_samples = 0, remaining_samples = 0, nsample_target = 0;
+   int lastgen = 0, igen = 0, expected_fields = 0, samples_this_run = 0, saved_ir = 0;
+   int ignored_samples = 0, checkpoint_gen = 0, progress_gen = 0, progress_total = 0;
+   int target_samples = 0, sample_now = 0, run_iterations = 0;
+   int restored_checkpoint_stats = 0;
    double lnL = 0, mlnL = 0, nround = 0, *x, *mx, postEFossil[MaxNFossils] = { 0 };
    double au = data.rgenepara[0], bu = data.rgenepara[1], a = data.rgenepara[2];
    char timestr[36];
@@ -4494,9 +4669,52 @@ int MCMC(FILE* fout)
    if (x == NULL) zerror("oom in mcmc");
    mx = x + com.np;
 
-   if (mcmc.print > 0)
-      fmcmc = zfopen(com.mcmcf, "w");
-   collectx(fmcmc, x);
+   expected_fields = com.np + 1 + (mcmc.usedata ? 1 : 0);
+   nsample_target = mcmc.nsample;
+   progress_total = mcmc.sampfreq * nsample_target;
+   target_samples = mcmc.nsample + (mcmc.sampfreq > 1);
+   autoresume = (com.checkpoint == 3 && FileExists(com.checkpointf));
+
+   if (autoresume) {
+      if (!FileExists(com.mcmcf)) {
+         printf("\nCheckpoint file %s exists, but mcmcfile %s does not.\n",
+            com.checkpointf, com.mcmcf);
+         zerror("automatic resume needs the existing mcmcfile; use checkpoint = 2 for old-style resume");
+      }
+      saved_ir = ReadMCMCstate(com.checkpointf, &nround, mx, &mlnL);
+      restored_checkpoint_stats = (nround > 0);
+      checkpoint_gen = saved_ir + 1;
+      existing_samples = CountMCMCSamples(com.mcmcf, expected_fields, checkpoint_gen, &lastgen, &ignored_samples);
+      if (ignored_samples)
+         existing_samples = TrimMCMCFileToGeneration(com.mcmcf, expected_fields, checkpoint_gen, &lastgen);
+      if (existing_samples >= target_samples) {
+         printf("\nAutomatic resume: %s already has %d samples (target = %d records for nsample = %d).\n",
+            com.mcmcf, existing_samples, target_samples, nsample_target);
+         if (mcmc.print)
+            DescriptiveStatisticsSimpleMCMCTREE(fout, com.mcmcf);
+         free(x);
+         FreeMem();
+         return(0);
+      }
+      remaining_samples = target_samples - existing_samples;
+      printf("\nAutomatic resume: found %s and %d existing samples in %s.\n",
+         com.checkpointf, existing_samples, com.mcmcf);
+      printf("Collecting %d more samples to complete nsample = %d.\n",
+         remaining_samples, nsample_target);
+   }
+   else if (com.checkpoint == 3) {
+      printf("\nAutomatic resume: checkpoint file %s was not found. Starting a new chain.\n",
+         com.checkpointf);
+      com.checkpoint = 1;
+   }
+
+   if (mcmc.print > 0) {
+      if (autoresume)
+         fmcmc = zfopen(com.mcmcf, "a");
+      else
+         fmcmc = zfopen(com.mcmcf, "w");
+   }
+   collectx(autoresume ? NULL : fmcmc, x);
    if (!com.fix_kappa && !com.fix_alpha && data.ngene == 2) { nxpr[0] = 6; nxpr[1] = 4; }
 
    puts("\npriors: ");
@@ -4518,9 +4736,18 @@ int MCMC(FILE* fout)
    }
 
    if (com.checkpoint == 2) {
-      ReadMCMCstate(com.checkpointf);
+      saved_ir = ReadMCMCstate(com.checkpointf, NULL, NULL, NULL);
+      collectx(NULL, x);
       mcmc.burnin = 0;
       printf("\nInitial parameters, np = %d.\nSptree & Genetrees read from %s.\n", com.np, com.checkpointf);
+      com.checkpoint = 1;
+   }
+   else if (autoresume) {
+      collectx(NULL, x);
+      mcmc.burnin = 0;
+      printf("\nInitial parameters, np = %d.\nSptree & Genetrees read from %s.\n", com.np, com.checkpointf);
+      printf("Checkpoint was saved at iteration %d. Appending new samples after generation %d.\n",
+         saved_ir, lastgen);
       com.checkpoint = 1;
    }
 
@@ -4545,10 +4772,13 @@ int MCMC(FILE* fout)
    else
       printf("paras: %d times, %d mu, %d sigma2 (& rates, kappa, alpha)\n", stree.nspecies - 1, data.ngene, data.ngene);
 
-   zero(mx, com.np);
+   if (!restored_checkpoint_stats)
+      zero(mx, com.np);
    if (com.np < nxpr[0] + nxpr[1]) { nxpr[0] = com.np; nxpr[1] = 0; }
-   for (ir = -mcmc.burnin; ir < mcmc.sampfreq*mcmc.nsample; ir++) {
-      if (ir == 0 || (nround >= 100 && mcmc.burnin >= 200 && ir < 0 && ir % (mcmc.burnin / 5) == 0)) {
+   run_iterations = (autoresume ? progress_total - checkpoint_gen : mcmc.sampfreq*mcmc.nsample);
+   for (ir = -mcmc.burnin; ir < run_iterations; ir++) {
+      if (((!autoresume || !restored_checkpoint_stats) && ir == 0)
+         || (nround >= 100 && mcmc.burnin >= 200 && ir < 0 && ir % (mcmc.burnin / 5) == 0)) {
          if (mcmc.burnin >= 200)
             ResetStepLengths(NULL, mcmc.Pjump, mcmc.steplength, mcmc.nsteplength);
 
@@ -4593,15 +4823,22 @@ int MCMC(FILE* fout)
       if (data.pfossilerror[0])
          getPfossilerr(postEFossil, nround);
 
-      if (mcmc.print && ir >= 0 && (ir == 0 || (ir + 1) % mcmc.sampfreq == 0)) {
-         fprintf(fmcmc, "%d", ir + 1);
+      igen = ir + 1;
+      if (autoresume)
+         igen += checkpoint_gen;
+      sample_now = (ir >= 0
+         && (autoresume ? (igen == 1 || igen % mcmc.sampfreq == 0) : (ir == 0 || (ir + 1) % mcmc.sampfreq == 0)));
+      if (mcmc.print && sample_now && (!autoresume || samples_this_run < remaining_samples)) {
+         fprintf(fmcmc, "%d", igen);
          for (j = 0; j < com.np; j++) fprintf(fmcmc, "\t%.7f", x[j]);
          if (mcmc.usedata) fprintf(fmcmc, "\t%.3f", lnL / BFbeta);
          fprintf(fmcmc, "\n");
          fflush(fmcmc);
+         samples_this_run++;
       }
-      if ((ir + 1) % max2(mcmc.sampfreq, mcmc.sampfreq*mcmc.nsample / 100) == 0) {
-         printf("\r%3.0f%%", (ir + 1.) / (mcmc.nsample*mcmc.sampfreq)*100.);
+      if ((ir + 1) % max2(mcmc.sampfreq, progress_total / 100) == 0) {
+         progress_gen = ir + 1 + (autoresume ? checkpoint_gen : 0);
+         printf("\r%3.0f%%", progress_gen / (double)progress_total * 100.);
 
          for (j = 0; j < 5; j++) printf(" %4.2f", mcmc.Pjump[j]);
          printf(" ");
@@ -4614,7 +4851,7 @@ int MCMC(FILE* fout)
          if (mcmc.usedata) printf(" %5.2f", mlnL);
       }
 
-      k = mcmc.sampfreq*mcmc.nsample;
+      k = progress_total;
       if (k > 20 && (ir+1) % (k/20) == 0) {
          testlnL = 1;
          if (fabs(lnL - lnpData(data.lnpDi)) > 0.001) {
@@ -4630,7 +4867,7 @@ int MCMC(FILE* fout)
       /* save MCMC state */
       if (com.checkpoint == 1 && k > 100 && ir > 0
          && (ir + 1) % (int)(k * com.checkpointp) == 0)
-         SaveMCMCstate(com.checkpointf, ir, data.lnpR, lnL);
+         SaveMCMCstate(com.checkpointf, ir + (autoresume ? checkpoint_gen : 0), data.lnpR, lnL, nround, mx, mlnL);
    }  /* for(ir) */
 
    if (mcmc.print) fclose(fmcmc);

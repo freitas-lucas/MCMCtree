@@ -1373,7 +1373,7 @@ void bigexp(double lnx, double *a, double *b)
    *a = pow(10, z - (*b));
 }
 
-unsigned int z_rndu = 666, w_rndu = 1237;
+unsigned int x_rndu = 11, y_rndu = 23, z_rndu = 666, w_rndu = 1237;
 
 void SetSeed(int seed, int PrintSeed)
 {
@@ -1406,6 +1406,24 @@ void SetSeed(int seed, int PrintSeed)
 
    z_rndu = (unsigned int)seed;
    w_rndu = (unsigned int)seed;
+   x_rndu = 11;
+   y_rndu = 23;
+}
+
+void GetRNGstate(unsigned int state[4])
+{
+   state[0] = x_rndu;
+   state[1] = y_rndu;
+   state[2] = z_rndu;
+   state[3] = w_rndu;
+}
+
+void SetRNGstate(unsigned int state[4])
+{
+   x_rndu = state[0];
+   y_rndu = state[1];
+   z_rndu = state[2];
+   w_rndu = state[3];
 }
 
 
@@ -1444,7 +1462,6 @@ double rndu(void)
       x, y, z are any numbers in the range 1-30000.  Integer operation up
       to 30323 required.
    */
-   static unsigned int x_rndu = 11, y_rndu = 23;
    double r;
 
    x_rndu = 171 * (x_rndu % 177) - 2 * (x_rndu / 177);

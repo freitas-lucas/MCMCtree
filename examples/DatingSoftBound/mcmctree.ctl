@@ -29,4 +29,4 @@
         burnin = 2000
       sampfreq = 10
        nsample = 20000
-    checkpoint = 1 0.01 mcmctree.ckpt1 * flag(0: none;  1: save;  2: resume) prob filename
+    checkpoint = 1 0.01 mcmctree.ckpt1 * flag(0: none;  1: save;  2: resume;  3: auto-resume append) prob filename
