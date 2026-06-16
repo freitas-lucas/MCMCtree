@@ -21,6 +21,17 @@
 
 #include "paml.h"
 
+#if(!defined _WIN32)
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#else
+#include <direct.h>
+#define getcwd _getcwd
+#endif
+
 
 #define NS            1025
 #define NBRANCH      (NS*2-2)
@@ -41,6 +52,8 @@ extern char BASEs[];
 extern double PjumpOptimum;
 
 int GetOptions(char *ctlf);
+int SetupParallelRuns(char cwd[]);
+void MakeAbsolutePath(char path[], char cwd[]);
 int ReadTreeSeqs(FILE*fout);
 int ProcessNodeAnnotation(int* haslabel);
 int ReadBlengthGH(char infile[]);
@@ -186,7 +199,7 @@ struct DATA { /* locus-specific data and tree information */
 }  data;
 
 struct MCMCPARAMETERS {
-   int burnin, nsample, sampfreq, usedata, saveconP, print;
+   int burnin, nsample, sampfreq, usedata, saveconP, print, nrun, seed;
    int nsteplength, steplengthOffset[8];
    char  *accept;
    double *steplength, *Pjump;
@@ -216,10 +229,109 @@ char *Btransform[] = { "", "square root", "logarithm", "arcsin" };
 #define MCMCTREE  1
 #include "treesub.c"
 
+int IsAbsolutePath(char path[])
+{
+   if (path[0] == '/' || path[0] == '\0') return(1);
+#if(defined _WIN32)
+   if (isalpha(path[0]) && path[1] == ':') return(1);
+#endif
+   return(0);
+}
+
+void MakeAbsolutePath(char path[], char cwd[])
+{
+   char tmp[4096];
+
+   if (IsAbsolutePath(path)) return;
+   snprintf(tmp, sizeof(tmp), "%s/%s", cwd, path);
+   strncpy(path, tmp, 2047);
+   path[2047] = '\0';
+}
+
+int WriteSeedUsedFile(int seed)
+{
+   FILE *fseed = (FILE*)fopen("SeedUsed", "w");
+
+   if (fseed == NULL) zerror("can't open file SeedUsed.");
+   fprintf(fseed, "%d\n", seed);
+   fclose(fseed);
+   return(0);
+}
+
+int SetupParallelRuns(char cwd[])
+{
+#if(defined _WIN32)
+   zerror("n_runs > 1 is not supported on Windows");
+   return(0);
+#else
+   int irun, status, failed = 0, seed;
+   pid_t pid, *pids;
+   char rundir[64];
+
+   if ((pids = (pid_t*)malloc(mcmc.nrun * sizeof(pid_t))) == NULL)
+      zerror("oom pids in SetupParallelRuns");
+
+   MakeAbsolutePath(com.seqf, cwd);
+   MakeAbsolutePath(com.treef, cwd);
+   if (mcmc.usedata == 2)
+      MakeAbsolutePath(com.inBVf, cwd);
+   if (com.seqtype == 2)
+      MakeAbsolutePath(com.daafile, cwd);
+
+   remove("SeedUsed");
+   printf("\nRunning %d independent MCMC analyses in parallel.\n", mcmc.nrun);
+   fflush(NULL);
+
+   for (irun = 0; irun < mcmc.nrun; irun++) {
+      sprintf(rundir, "run%d", irun + 1);
+      if (mkdir(rundir, 0777) && errno != EEXIST)
+         zerror("failed to create run directory");
+
+      pid = fork();
+      if (pid < 0)
+         zerror("fork failed");
+      if (pid == 0) {
+         int resume_from_checkpoint;
+
+         if (chdir(rundir))
+            zerror("failed to enter run directory");
+         resume_from_checkpoint = ((com.checkpoint == 2 || com.checkpoint == 3)
+            && FileExists(com.checkpointf));
+         if (!resume_from_checkpoint) {
+            seed = (mcmc.seed <= 0 ? -1 : mcmc.seed + irun);
+            SetSeed(seed, seed <= 0);
+            if (seed > 0)
+               WriteSeedUsedFile(seed);
+         }
+         else {
+            printf("\n[run%d] Found %s; preserving SeedUsed and restoring RNG from checkpoint.\n",
+               irun + 1, com.checkpointf);
+         }
+         printf("\n[run%d] Writing results in %s/%s\n", irun + 1, cwd, rundir);
+         free(pids);
+         return(1);
+      }
+      pids[irun] = pid;
+   }
+
+   for (irun = 0; irun < mcmc.nrun; irun++) {
+      if (waitpid(pids[irun], &status, 0) < 0)
+         failed = 1;
+      else if (!WIFEXITED(status) || WEXITSTATUS(status))
+         failed = 1;
+   }
+   free(pids);
+   if (failed)
+      zerror("one or more parallel MCMC analyses failed");
+   printf("\nFinished %d independent MCMC analyses.\n", mcmc.nrun);
+   return(0);
+#endif
+}
+
 
 int main(int argc, char *argv[])
 {
-   char ctlf[4096] = "mcmctree.ctl";
+   char ctlf[4096] = "mcmctree.ctl", cwd[4096];
    int i, j, k = 6;
    FILE  *fout;
 
@@ -260,7 +372,13 @@ int main(int argc, char *argv[])
    strcpy(com.mcmcf, "mcmc.txt");
 
    starttimer();
+   if (getcwd(cwd, sizeof(cwd)) == NULL)
+      zerror("getcwd failed");
    GetOptions(ctlf);
+   if (mcmc.nrun > 1 && mcmc.usedata != 3) {
+      if (!SetupParallelRuns(cwd))
+         exit(0);
+   }
 
    fout = zfopen(com.outf, "w");
    fprintf(fout, "MCMCTREE (%s) %s\n", pamlVerStr, com.seqf);
@@ -1664,18 +1782,20 @@ int GenerateBlengthGH(char infile[])
 int GetOptions(char *ctlf)
 {
    int  transform0 = ARCSIN_B; /* default transform: SQRT_B, LOG_B, ARCSIN_B */
-   int  iopt, i, j, nopt = 32, lline = 4096;
+   int  iopt, i, j, nopt = 33, lline = 4096;
    char line[4096], *pline, opt[33], *comment = "*#", ch;
    char *optstr[] = { "seed", "seqfile","treefile", "outfile", "mcmcfile", "checkpoint", "BayesFactorBeta",
         "seqtype", "aaRatefile", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
         "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
-        "print", "burnin", "sampfreq", "nsample", "finetune" };
+        "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs" };
    double t = 1, *eps = mcmc.steplength;
    FILE  *fctl = zfopen(ctlf, "r");
 
    data.rgeneprior = 0;  /* default rate prior is gamma-Dirichlet. */
    data.transform = transform0;
+   mcmc.nrun = 1;
+   mcmc.seed = 0;
    com.checkpointp = 0.1;
    strcpy(com.checkpointf, "mcmctree.ckpt");
    if (fctl) {
@@ -1700,7 +1820,7 @@ int GetOptions(char *ctlf)
                if (noisy >= 9)
                   printf("\n%3d %15s | %-20s %6.2f", iopt + 1, optstr[iopt], opt, t);
                switch (iopt) {
-               case (0): SetSeed((int)t, 1);                 break;
+               case (0): mcmc.seed = (int)t; SetSeed(mcmc.seed, 1); break;
                case (1): sscanf(pline + 1, "%s", com.seqf);    break;
                case (2): sscanf(pline + 1, "%s", com.treef);   break;
                case (3): sscanf(pline + 1, "%s", com.outf);    break;
@@ -1786,6 +1906,7 @@ int GetOptions(char *ctlf)
                   break;
                   sscanf(pline + 1, "%d:%lf%lf%lf%lf%lf%lf", &j, eps, eps + 1, eps + 2, eps + 3, eps + 4, eps + 5);
                   break;
+               case (32): mcmc.nrun = (int)t;     break;
                }
                break;
             }
@@ -1803,6 +1924,8 @@ int GetOptions(char *ctlf)
       zerror("raise NGENE?");
    else if (com.ndata <= 0)
       com.ndata = 1;
+   if (mcmc.nrun < 1)
+      zerror("n_runs should be >= 1");
    if (mcmc.usedata == 2) {
       com.model = 0;  com.fix_kappa = com.fix_alpha = 1; com.alpha = 0;
       if (com.seqtype == 1) com.ncode = 61;

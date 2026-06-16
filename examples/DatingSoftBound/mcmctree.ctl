@@ -29,4 +29,5 @@
         burnin = 2000
       sampfreq = 10
        nsample = 20000
+        n_runs = 1   * number of independent MCMC runs to run in parallel
     checkpoint = 1 0.01 mcmctree.ckpt1 * flag(0: none;  1: save;  2: resume;  3: auto-resume append) prob filename

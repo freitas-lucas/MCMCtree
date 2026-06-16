@@ -31,3 +31,4 @@
         burnin = 20000
       sampfreq = 100
        nsample = 2000
+        n_runs = 1   * number of independent MCMC runs to run in parallel

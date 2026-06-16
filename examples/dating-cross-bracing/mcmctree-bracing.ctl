@@ -25,5 +25,6 @@
         burnin = 20000
       sampfreq = 100
        nsample = 2000
+        n_runs = 1   * number of independent MCMC runs to run in parallel
 *   checkpoint = 1 0.01 mcmctree.ckpt1 * Type of checkpointing: 0: none (default);  1: save;  2: resume;  3: auto-resume append
    duplication = 1  * Enable equality/inequality constraints? 1: yes; 0: no (default)                
