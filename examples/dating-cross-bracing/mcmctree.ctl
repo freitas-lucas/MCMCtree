@@ -27,4 +27,10 @@
        nsample = 2000
         n_runs = 1   * number of independent MCMC runs to run in parallel
 *   checkpoint = 1 0.01 mcmctree.ckpt1 * Type of checkpointing: 0: none (default);  1: save;  2: resume;  3: auto-resume append
+
+    burnin_per = -1   * -1: classic burnin/nsample; >=0: adaptive chunks discard this fraction for diagnostics/summaries
+    chunk_size = 1000 * adaptive mode: samples added per chain before checking convergence/ESS
+   target_rhat = 1.01 * adaptive mode: stop after all parameters have Rhat <= target_rhat
+    target_ess = 200  * adaptive mode: stop after combined post-burnin ESS reaches target_ess for all parameters
+   max_samples = 20000 * adaptive mode: maximum samples per chain
    duplication = 0  * Enable equality/inequality constraints? 1: yes; 0: no (default)                

@@ -90,6 +90,11 @@ int MCMC(FILE* fout);
 int FileExists(char *filename);
 int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastgen, int *nskipped);
 int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, int *lastgen);
+int SetupAdaptiveParallelRuns(char cwd[]);
+int CombineRunsPostBurnin(char outfile[], int nrun, int burnin_samples);
+int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess);
+int CreatePostBurninMCMCFile(char infile[], char outfile[], int burnin_samples);
+int MeanMCMCFile(char infile[], int np, double mx[]);
 int LabelOldCondP(int spnode);
 int UpdateTimes(double *lnL, double steplength[], char accept[]);
 int UpdateTimesClock23(double *lnL, double steplength[], char accept[]);
@@ -200,8 +205,10 @@ struct DATA { /* locus-specific data and tree information */
 
 struct MCMCPARAMETERS {
    int burnin, nsample, sampfreq, usedata, saveconP, print, nrun, seed;
+   int chunkSize, targetESS, maxSamples;
    int nsteplength, steplengthOffset[8];
    char  *accept;
+   double burninPer, targetRhat;
    double *steplength, *Pjump;
 }  mcmc; /* control parameters */
 
@@ -328,6 +335,84 @@ int SetupParallelRuns(char cwd[])
 #endif
 }
 
+int SetupAdaptiveParallelRuns(char cwd[])
+{
+#if(defined _WIN32)
+   zerror("adaptive n_runs is not supported on Windows");
+   return(0);
+#else
+   int original_nsample = mcmc.nsample, target_samples, done = 0, round = 0;
+   double max_rhat = 99, min_ess = 0;
+   char combinedf[256] = "combined_mcmc.txt";
+   FILE *fout;
+
+   if (mcmc.nrun < 2)
+      zerror("adaptive MCMC needs n_runs > 1");
+   if (mcmc.chunkSize < 1 || mcmc.maxSamples < 1)
+      zerror("chunk_size and max_samples should be > 0");
+   if (mcmc.targetESS <= 0)
+      zerror("target_ess should be > 0");
+   if (mcmc.targetRhat <= 1)
+      zerror("target_rhat should be > 1");
+
+   MakeAbsolutePath(com.seqf, cwd);
+   MakeAbsolutePath(com.treef, cwd);
+   if (mcmc.usedata == 2)
+      MakeAbsolutePath(com.inBVf, cwd);
+   if (com.seqtype == 2)
+      MakeAbsolutePath(com.daafile, cwd);
+
+   printf("\nAdaptive MCMC with %d independent runs.\n", mcmc.nrun);
+   printf("chunk_size = %d, burnin_per = %.4f, target_rhat = %.4f, target_ess = %d, max_samples = %d\n",
+      mcmc.chunkSize, mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples);
+   mcmc.burnin = 0;
+
+   for (target_samples = mcmc.chunkSize; target_samples <= mcmc.maxSamples; target_samples += mcmc.chunkSize) {
+      int burnin_samples = (int)(target_samples * mcmc.burninPer + 0.5);
+
+      round++;
+      if (burnin_samples < 0) burnin_samples = 0;
+      if (burnin_samples >= target_samples) burnin_samples = target_samples - 1;
+
+      printf("\nAdaptive round %d: running each chain to %d samples.\n", round, target_samples);
+      mcmc.nsample = target_samples;
+      com.checkpoint = 3;
+      if (SetupParallelRuns(cwd))
+         return(1);
+
+      if (CombineRunsPostBurnin(combinedf, mcmc.nrun, burnin_samples))
+         zerror("failed to combine post-burnin MCMC samples");
+
+      if (CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess))
+         done = 1;
+
+      printf("\nDiagnostics after %d samples/run: max Rhat = %.5f, min ESS = %.1f\n",
+         target_samples, max_rhat, min_ess);
+      if (done) {
+         printf("Stopping: convergence and ESS targets reached.\n");
+         break;
+      }
+   }
+
+   if (!done)
+      printf("\nWarning: max_samples reached before convergence/ESS targets. max Rhat = %.5f, min ESS = %.1f\n",
+         max_rhat, min_ess);
+
+   mcmc.nsample = original_nsample;
+   fout = zfopen("combined_out.txt", "w");
+   fprintf(fout, "MCMCTREE combined summary (%s) %s\n", pamlVerStr, com.seqf);
+   ReadTreeSeqs(fout);
+   fprintf(fout, "\nAdaptive MCMC summary across %d independent runs\n", mcmc.nrun);
+   fprintf(fout, "burnin_per = %.4f  target_rhat = %.4f  target_ess = %d  max_samples = %d\n",
+      mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples);
+   fprintf(fout, "Final diagnostics: max Rhat = %.5f  min ESS = %.1f\n", max_rhat, min_ess);
+   DescriptiveStatisticsSimpleMCMCTREE(fout, combinedf);
+   fclose(fout);
+   rename("FigTree.tre", "combined_FigTree.tre");
+   return(0);
+#endif
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -375,7 +460,11 @@ int main(int argc, char *argv[])
    if (getcwd(cwd, sizeof(cwd)) == NULL)
       zerror("getcwd failed");
    GetOptions(ctlf);
-   if (mcmc.nrun > 1 && mcmc.usedata != 3) {
+   if (mcmc.burninPer >= 0 && mcmc.usedata != 3) {
+      if (!SetupAdaptiveParallelRuns(cwd))
+         exit(0);
+   }
+   else if (mcmc.nrun > 1 && mcmc.usedata != 3) {
       if (!SetupParallelRuns(cwd))
          exit(0);
    }
@@ -1055,6 +1144,220 @@ int FirstFieldIsNumber(char line[])
    if (*p == '\0') return(0);
    strtod(p, &endp);
    return(endp > p);
+}
+
+int ReadMCMCPostBurnin(char filename[], int burnin_samples, int *n, int *p, double **data, char header[], int lheader)
+{
+   FILE *fin = zfopen(filename, "r");
+   char *line, *endp;
+   int lline = 1000000, nrow = 0, ncol = 0, cap = 1024, i, j;
+   double *x, v;
+
+   line = (char*)malloc(lline * sizeof(char));
+   if (line == NULL) zerror("oom line in ReadMCMCPostBurnin");
+   if (fgets(line, lline, fin) == NULL)
+      zerror("empty mcmc file");
+   ncol = CountFields(line);
+   if (header && lheader > 0) {
+      strncpy(header, line, lheader - 1);
+      header[lheader - 1] = '\0';
+   }
+   x = (double*)malloc((size_t)cap * ncol * sizeof(double));
+   if (x == NULL) zerror("oom data in ReadMCMCPostBurnin");
+
+   for (i = 0; fgets(line, lline, fin); i++) {
+      if (i < burnin_samples) continue;
+      if (CountFields(line) != ncol) continue;
+      if (nrow >= cap) {
+         int oldcap = cap;
+         double *xnew;
+         cap *= 2;
+         xnew = (double*)malloc((size_t)cap * ncol * sizeof(double));
+         if (xnew == NULL) zerror("oom realloc data in ReadMCMCPostBurnin");
+         for (j = 0; j < ncol; j++)
+            memcpy(xnew + j*cap, x + j*oldcap, nrow * sizeof(double));
+         free(x);
+         x = xnew;
+      }
+      endp = line;
+      for (j = 0; j < ncol; j++) {
+         v = strtod(endp, &endp);
+         x[j*cap + nrow] = v;
+      }
+      nrow++;
+   }
+   fclose(fin);
+   free(line);
+
+   *data = (double*)malloc((size_t)nrow * ncol * sizeof(double));
+   if (*data == NULL && nrow*ncol > 0) zerror("oom compact data in ReadMCMCPostBurnin");
+   for (j = 0; j < ncol; j++)
+      for (i = 0; i < nrow; i++)
+         (*data)[j*nrow + i] = x[j*cap + i];
+   free(x);
+   *n = nrow;
+   *p = ncol;
+   return(0);
+}
+
+int CreatePostBurninMCMCFile(char infile[], char outfile[], int burnin_samples)
+{
+   FILE *fin = zfopen(infile, "r"), *fout = zfopen(outfile, "w");
+   char *line, *tab;
+   int lline = 1000000, i, n = 0;
+
+   line = (char*)malloc(lline * sizeof(char));
+   if (line == NULL) zerror("oom line in CreatePostBurninMCMCFile");
+   if (fgets(line, lline, fin) == NULL)
+      zerror("empty mcmc file");
+   fputs(line, fout);
+   for (i = 0; fgets(line, lline, fin); i++) {
+      if (i < burnin_samples) continue;
+      tab = strchr(line, '\t');
+      if (tab == NULL) continue;
+      fprintf(fout, "%d%s", ++n, tab);
+   }
+   fclose(fin);
+   fclose(fout);
+   free(line);
+   return(n);
+}
+
+int CombineRunsPostBurnin(char outfile[], int nrun, int burnin_samples)
+{
+   FILE *fout = zfopen(outfile, "w"), *fin;
+   char filename[256], header[100000], *line, *tab;
+   int irun, i, lline = 1000000, n = 0, wrote_header = 0;
+
+   line = (char*)malloc(lline * sizeof(char));
+   if (line == NULL) zerror("oom line in CombineRunsPostBurnin");
+   for (irun = 1; irun <= nrun; irun++) {
+      sprintf(filename, "run%d/%s", irun, com.mcmcf);
+      fin = zfopen(filename, "r");
+      if (fgets(header, sizeof(header), fin) == NULL)
+         zerror("empty run mcmc file");
+      if (!wrote_header) {
+         fputs(header, fout);
+         wrote_header = 1;
+      }
+      for (i = 0; fgets(line, lline, fin); i++) {
+         if (i < burnin_samples) continue;
+         tab = strchr(line, '\t');
+         if (tab == NULL) continue;
+         fprintf(fout, "%d%s", ++n, tab);
+      }
+      fclose(fin);
+   }
+   fclose(fout);
+   free(line);
+   return(0);
+}
+
+int MeanMCMCFile(char infile[], int np, double mx[])
+{
+   double *dat = NULL;
+   int n = 0, p = 0, i, j;
+
+   ReadMCMCPostBurnin(infile, 0, &n, &p, &dat, NULL, 0);
+   if (p < np + 1 || n <= 0)
+      zerror("not enough samples in MeanMCMCFile");
+   zero(mx, np);
+   for (j = 0; j < np; j++)
+      for (i = 0; i < n; i++)
+         mx[j] += dat[(j + 1)*n + i] / n;
+   free(dat);
+   return(0);
+}
+
+int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess)
+{
+   char filename[256], header[100000];
+   char *header_copy, *token;
+   double **run_data, *combined = NULL, *y, mean, var, rho1, W, B, grand, rhat, ess;
+   int *nr, *check_col, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
+
+   run_data = (double**)malloc(nrun * sizeof(double*));
+   nr = (int*)malloc(nrun * sizeof(int));
+   if (run_data == NULL || nr == NULL) zerror("oom in CheckConvergenceESS");
+   for (irun = 0; irun < nrun; irun++) {
+      sprintf(filename, "run%d/%s", irun + 1, com.mcmcf);
+      ReadMCMCPostBurnin(filename, burnin_samples, &nr[irun], (irun == 0 ? &p : &p2), &run_data[irun], header, sizeof(header));
+      if (irun && p2 != p) zerror("mcmc files have different columns");
+      if (nr[irun] < 2) pass = 0;
+   }
+   ReadMCMCPostBurnin(combinedf, 0, &ncombined, &p2, &combined, NULL, 0);
+   if (p2 != p) zerror("combined mcmc has different columns");
+
+   check_col = (int*)malloc(p * sizeof(int));
+   header_copy = (char*)malloc((strlen(header) + 1) * sizeof(char));
+   if (check_col == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
+   memset(check_col, 0, p * sizeof(int));
+   strcpy(header_copy, header);
+   for (j = 0, token = strtok(header_copy, " \t\r\n"); token && j < p; j++, token = strtok(NULL, " \t\r\n")) {
+      if (strncmp(token, "t_n", 3) == 0) {
+         check_col[j] = 1;
+         ncheck++;
+      }
+   }
+   if (ncheck == 0)
+      zerror("no t_n columns found for convergence/ESS checks");
+
+   *max_rhat = 0;
+   *min_ess = 1e300;
+   y = (double*)malloc(ncombined * sizeof(double));
+   if (y == NULL) zerror("oom y in CheckConvergenceESS");
+   nmin = nr[0];
+   for (irun = 1; irun < nrun; irun++)
+      if (nr[irun] < nmin) nmin = nr[irun];
+   if (nmin < 2 || ncombined < 2)
+      pass = 0;
+
+   for (j = 1; j < p; j++) {
+      double *means, *vars;
+      if (!check_col[j])
+         continue;
+
+      means = (double*)malloc(nrun * sizeof(double));
+      vars = (double*)malloc(nrun * sizeof(double));
+      if (means == NULL || vars == NULL) zerror("oom means vars");
+      grand = 0;
+      for (irun = 0; irun < nrun; irun++) {
+         means[irun] = 0;
+         for (i = 0; i < nmin; i++)
+            means[irun] += run_data[irun][j*nr[irun] + i] / nmin;
+         grand += means[irun] / nrun;
+      }
+      W = B = 0;
+      for (irun = 0; irun < nrun; irun++) {
+         vars[irun] = 0;
+         if (nmin > 1) {
+            for (i = 0; i < nmin; i++)
+               vars[irun] += square(run_data[irun][j*nr[irun] + i] - means[irun]) / (nmin - 1);
+         }
+         W += vars[irun] / nrun;
+         B += square(means[irun] - grand) * nmin / (nrun - 1);
+      }
+      rhat = (nmin > 1 && W > 0 ? sqrt(((nmin - 1.0) / nmin * W + B / nmin) / W) : 99);
+      if (rhat > *max_rhat) *max_rhat = rhat;
+      for (i = 0; i < ncombined; i++)
+         y[i] = combined[j*ncombined + i];
+      ess = 1 / Eff_IntegratedCorrelationTime(y, ncombined, &mean, &var, &rho1);
+      if (ess < *min_ess) *min_ess = ess;
+      if (rhat > target_rhat || ess < target_ess)
+         pass = 0;
+      free(means);
+      free(vars);
+   }
+
+   for (irun = 0; irun < nrun; irun++)
+      free(run_data[irun]);
+   free(run_data);
+   free(nr);
+   free(check_col);
+   free(header_copy);
+   free(combined);
+   free(y);
+   return(pass);
 }
 
 int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastgen, int *nskipped)
@@ -1782,13 +2085,14 @@ int GenerateBlengthGH(char infile[])
 int GetOptions(char *ctlf)
 {
    int  transform0 = ARCSIN_B; /* default transform: SQRT_B, LOG_B, ARCSIN_B */
-   int  iopt, i, j, nopt = 33, lline = 4096;
+   int  iopt, i, j, nopt = 38, lline = 4096;
    char line[4096], *pline, opt[33], *comment = "*#", ch;
    char *optstr[] = { "seed", "seqfile","treefile", "outfile", "mcmcfile", "checkpoint", "BayesFactorBeta",
         "seqtype", "aaRatefile", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
         "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
-        "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs" };
+        "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs",
+        "burnin_per", "chunk_size", "target_rhat", "target_ess", "max_samples" };
    double t = 1, *eps = mcmc.steplength;
    FILE  *fctl = zfopen(ctlf, "r");
 
@@ -1796,6 +2100,11 @@ int GetOptions(char *ctlf)
    data.transform = transform0;
    mcmc.nrun = 1;
    mcmc.seed = 0;
+   mcmc.burninPer = -1;
+   mcmc.chunkSize = 1000;
+   mcmc.targetRhat = 1.01;
+   mcmc.targetESS = 200;
+   mcmc.maxSamples = 20000;
    com.checkpointp = 0.1;
    strcpy(com.checkpointf, "mcmctree.ckpt");
    if (fctl) {
@@ -1906,7 +2215,12 @@ int GetOptions(char *ctlf)
                   break;
                   sscanf(pline + 1, "%d:%lf%lf%lf%lf%lf%lf", &j, eps, eps + 1, eps + 2, eps + 3, eps + 4, eps + 5);
                   break;
-               case (32): mcmc.nrun = (int)t;     break;
+               case (32): mcmc.nrun = (int)t;        break;
+               case (33): mcmc.burninPer = t;        break;
+               case (34): mcmc.chunkSize = (int)t;   break;
+               case (35): mcmc.targetRhat = t;       break;
+               case (36): mcmc.targetESS = (int)t;   break;
+               case (37): mcmc.maxSamples = (int)t;  break;
                }
                break;
             }
@@ -1926,6 +2240,14 @@ int GetOptions(char *ctlf)
       com.ndata = 1;
    if (mcmc.nrun < 1)
       zerror("n_runs should be >= 1");
+   if (mcmc.burninPer < -1 || mcmc.burninPer >= 1)
+      zerror("burnin_per should be -1 or in [0,1)");
+   if (mcmc.burninPer >= 0) {
+      if (mcmc.chunkSize < 1 || mcmc.maxSamples < 1 || mcmc.targetESS < 1)
+         zerror("chunk_size, max_samples, and target_ess should be positive");
+      if (mcmc.targetRhat <= 1)
+         zerror("target_rhat should be > 1");
+   }
    if (mcmc.usedata == 2) {
       com.model = 0;  com.fix_kappa = com.fix_alpha = 1; com.alpha = 0;
       if (com.seqtype == 1) com.ncode = 61;
@@ -4813,8 +5135,18 @@ int MCMC(FILE* fout)
       if (existing_samples >= target_samples) {
          printf("\nAutomatic resume: %s already has %d samples (target = %d records for nsample = %d).\n",
             com.mcmcf, existing_samples, target_samples, nsample_target);
-         if (mcmc.print)
-            DescriptiveStatisticsSimpleMCMCTREE(fout, com.mcmcf);
+         if (mcmc.print) {
+            if (mcmc.burninPer >= 0) {
+               int burnin_samples = (int)(mcmc.nsample * mcmc.burninPer + 0.5);
+               if (burnin_samples < 0) burnin_samples = 0;
+               if (burnin_samples >= mcmc.nsample) burnin_samples = mcmc.nsample - 1;
+               CreatePostBurninMCMCFile(com.mcmcf, "mcmc.postburnin.tmp", burnin_samples);
+               DescriptiveStatisticsSimpleMCMCTREE(fout, "mcmc.postburnin.tmp");
+               remove("mcmc.postburnin.tmp");
+            }
+            else
+               DescriptiveStatisticsSimpleMCMCTREE(fout, com.mcmcf);
+         }
          free(x);
          FreeMem();
          return(0);
@@ -4999,7 +5331,16 @@ int MCMC(FILE* fout)
    printf("\nTime used: %s", printtime(timestr));
    fprintf(fout, "\nTime used: %s", printtime(timestr));
 
-   fprintf(fout, "\n\nmean of parameters using all iterations\n");
+   if (mcmc.burninPer >= 0) {
+      int burnin_samples = (int)(mcmc.nsample * mcmc.burninPer + 0.5);
+      if (burnin_samples < 0) burnin_samples = 0;
+      if (burnin_samples >= mcmc.nsample) burnin_samples = mcmc.nsample - 1;
+      CreatePostBurninMCMCFile(com.mcmcf, "mcmc.postburnin.tmp", burnin_samples);
+      MeanMCMCFile("mcmc.postburnin.tmp", com.np, mx);
+   }
+
+   fprintf(fout, "\n\nmean of parameters using %s iterations\n",
+      (mcmc.burninPer >= 0 ? "post-burnin" : "all"));
    for (i = 0; i < com.np; i++)  fprintf(fout, " %9.5f", mx[i]);
    fprintf(fout, "\n");
 
@@ -5014,8 +5355,14 @@ int MCMC(FILE* fout)
    fprintf(fout, "\n");    OutTreeN(fout, 1, PrNodeNum);
    fprintf(fout, "\n\n");  OutTreeN(fout, 1, 1);   fprintf(fout, "\n");
 
-   if (mcmc.print)
-      DescriptiveStatisticsSimpleMCMCTREE(fout, com.mcmcf);
+   if (mcmc.print) {
+      if (mcmc.burninPer >= 0) {
+         DescriptiveStatisticsSimpleMCMCTREE(fout, "mcmc.postburnin.tmp");
+         remove("mcmc.postburnin.tmp");
+      }
+      else
+         DescriptiveStatisticsSimpleMCMCTREE(fout, com.mcmcf);
+   }
    if (data.pfossilerror[0]) {
       free(data.CcomFossilErr);
       printf("\nPosterior probabilities that each fossil is in error.\n");
