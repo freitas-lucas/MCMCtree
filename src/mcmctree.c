@@ -92,7 +92,8 @@ int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastg
 int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, int *lastgen);
 int SetupAdaptiveParallelRuns(char cwd[]);
 int CombineRunsPostBurnin(char outfile[], int nrun, int burnin_samples);
-int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess);
+int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
+   FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin);
 int CreatePostBurninMCMCFile(char infile[], char outfile[], int burnin_samples);
 int MeanMCMCFile(char infile[], int np, double mx[]);
 int LabelOldCondP(int spnode);
@@ -342,9 +343,10 @@ int SetupAdaptiveParallelRuns(char cwd[])
    return(0);
 #else
    int original_nsample = mcmc.nsample, target_samples, done = 0, round = 0;
+   int rhat_pass = 0, ess_pass = 0, postburnin_per_run = 0, combined_postburnin = 0;
    double max_rhat = 99, min_ess = 0;
    char combinedf[256] = "combined_mcmc.txt";
-   FILE *fout;
+   FILE *fout, *fstats, *fparam;
 
    if (mcmc.nrun < 2)
       zerror("adaptive MCMC needs n_runs > 1");
@@ -367,6 +369,13 @@ int SetupAdaptiveParallelRuns(char cwd[])
       mcmc.chunkSize, mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples);
    mcmc.burnin = 0;
 
+   fstats = zfopen("adaptive_stats.txt", "w");
+   fprintf(fstats, "chunk\tsamples_per_run\tburnin_samples\tpostburnin_per_run\tcombined_postburnin_samples\tmax_rhat\tmin_ess\trhat_pass\tess_pass\tstop\n");
+   fclose(fstats);
+   fparam = zfopen("adaptive_stats_by_parameter.txt", "w");
+   fprintf(fparam, "chunk\tsamples_per_run\tburnin_samples\tparameter\trhat\tess\trhat_pass\tess_pass\n");
+   fclose(fparam);
+
    for (target_samples = mcmc.chunkSize; target_samples <= mcmc.maxSamples; target_samples += mcmc.chunkSize) {
       int burnin_samples = (int)(target_samples * mcmc.burninPer + 0.5);
 
@@ -383,8 +392,17 @@ int SetupAdaptiveParallelRuns(char cwd[])
       if (CombineRunsPostBurnin(combinedf, mcmc.nrun, burnin_samples))
          zerror("failed to combine post-burnin MCMC samples");
 
-      if (CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess))
+      fparam = zfopen("adaptive_stats_by_parameter.txt", "a");
+      if (CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
+            fparam, round, target_samples, &rhat_pass, &ess_pass, &postburnin_per_run, &combined_postburnin))
          done = 1;
+      fclose(fparam);
+
+      fstats = zfopen("adaptive_stats.txt", "a");
+      fprintf(fstats, "%d\t%d\t%d\t%d\t%d\t%.8g\t%.8g\t%d\t%d\t%d\n",
+         round, target_samples, burnin_samples, postburnin_per_run, combined_postburnin,
+         max_rhat, min_ess, rhat_pass, ess_pass, done);
+      fclose(fstats);
 
       printf("\nDiagnostics after %d samples/run: max Rhat = %.5f, min ESS = %.1f\n",
          target_samples, max_rhat, min_ess);
@@ -1269,11 +1287,12 @@ int MeanMCMCFile(char infile[], int np, double mx[])
    return(0);
 }
 
-int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess)
+int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
+   FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin)
 {
    char filename[256], header[100000];
-   char *header_copy, *token;
-   double **run_data, *combined = NULL, *y, mean, var, rho1, W, B, grand, rhat, ess;
+   char *header_copy, *token, **varname;
+   double **run_data, *combined = NULL, *y, mean, var, rho1, W, B, grand, rhat, eff, ess;
    int *nr, *check_col, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
 
    run_data = (double**)malloc(nrun * sizeof(double*));
@@ -1289,11 +1308,19 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    if (p2 != p) zerror("combined mcmc has different columns");
 
    check_col = (int*)malloc(p * sizeof(int));
+   varname = (char**)malloc(p * sizeof(char*));
    header_copy = (char*)malloc((strlen(header) + 1) * sizeof(char));
-   if (check_col == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
+   if (check_col == NULL || varname == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
    memset(check_col, 0, p * sizeof(int));
+   for (j = 0; j < p; j++) {
+      varname[j] = (char*)malloc(64 * sizeof(char));
+      if (varname[j] == NULL) zerror("oom varname in CheckConvergenceESS");
+      varname[j][0] = '\0';
+   }
    strcpy(header_copy, header);
    for (j = 0, token = strtok(header_copy, " \t\r\n"); token && j < p; j++, token = strtok(NULL, " \t\r\n")) {
+      strncpy(varname[j], token, 63);
+      varname[j][63] = '\0';
       if (strncmp(token, "t_n", 3) == 0) {
          check_col[j] = 1;
          ncheck++;
@@ -1304,13 +1331,20 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
 
    *max_rhat = 0;
    *min_ess = 1e300;
+   *rhat_pass = 1;
+   *ess_pass = 1;
    y = (double*)malloc(ncombined * sizeof(double));
    if (y == NULL) zerror("oom y in CheckConvergenceESS");
    nmin = nr[0];
    for (irun = 1; irun < nrun; irun++)
       if (nr[irun] < nmin) nmin = nr[irun];
-   if (nmin < 2 || ncombined < 2)
+   *postburnin_per_run = nmin;
+   *combined_postburnin = ncombined;
+   if (nmin < 2 || ncombined < 2) {
       pass = 0;
+      *rhat_pass = 0;
+      *ess_pass = 0;
+   }
 
    for (j = 1; j < p; j++) {
       double *means, *vars;
@@ -1339,10 +1373,22 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       }
       rhat = (nmin > 1 && W > 0 ? sqrt(((nmin - 1.0) / nmin * W + B / nmin) / W) : 99);
       if (rhat > *max_rhat) *max_rhat = rhat;
-      for (i = 0; i < ncombined; i++)
-         y[i] = combined[j*ncombined + i];
-      ess = 1 / Eff_IntegratedCorrelationTime(y, ncombined, &mean, &var, &rho1);
+      if (ncombined > 1) {
+         for (i = 0; i < ncombined; i++)
+            y[i] = combined[j*ncombined + i];
+         eff = Eff_IntegratedCorrelationTime(y, ncombined, &mean, &var, &rho1);
+         ess = ncombined * eff;
+      }
+      else
+         ess = 0;
       if (ess < *min_ess) *min_ess = ess;
+      if (rhat > target_rhat)
+         *rhat_pass = 0;
+      if (ess < target_ess)
+         *ess_pass = 0;
+      if (fparam)
+         fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t%.8g\t%d\t%d\n",
+            chunk, samples_per_run, burnin_samples, varname[j], rhat, ess, rhat <= target_rhat, ess >= target_ess);
       if (rhat > target_rhat || ess < target_ess)
          pass = 0;
       free(means);
@@ -1354,6 +1400,9 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    free(run_data);
    free(nr);
    free(check_col);
+   for (j = 0; j < p; j++)
+      free(varname[j]);
+   free(varname);
    free(header_copy);
    free(combined);
    free(y);
