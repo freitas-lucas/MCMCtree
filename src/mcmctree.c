@@ -342,7 +342,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
    zerror("adaptive n_runs is not supported on Windows");
    return(0);
 #else
-   int original_nsample = mcmc.nsample, target_samples, done = 0, round = 0;
+   int original_nsample = mcmc.nsample, target_samples, done = 0, round = 0, current_pass = 0, consecutive_pass = 0;
    int rhat_pass = 0, ess_pass = 0, postburnin_per_run = 0, combined_postburnin = 0;
    double max_rhat = 99, min_ess = 0;
    char combinedf[256] = "combined_mcmc.txt";
@@ -370,7 +370,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
    mcmc.burnin = 0;
 
    fstats = zfopen("adaptive_stats.txt", "w");
-   fprintf(fstats, "chunk\tsamples_per_run\tburnin_samples\tpostburnin_per_run\tcombined_postburnin_samples\tmax_rhat\tmin_ess\trhat_pass\tess_pass\tstop\n");
+   fprintf(fstats, "chunk\tsamples_per_run\tburnin_samples\tpostburnin_per_run\tcombined_postburnin_samples\tmax_rhat\tmin_ess\trhat_pass\tess_pass\tconsecutive_pass\tstop\n");
    fclose(fstats);
    fparam = zfopen("adaptive_stats_by_parameter.txt", "w");
    fprintf(fparam, "chunk\tsamples_per_run\tburnin_samples\tparameter\trhat\tess\trhat_pass\tess_pass\n");
@@ -393,21 +393,22 @@ int SetupAdaptiveParallelRuns(char cwd[])
          zerror("failed to combine post-burnin MCMC samples");
 
       fparam = zfopen("adaptive_stats_by_parameter.txt", "a");
-      if (CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
-            fparam, round, target_samples, &rhat_pass, &ess_pass, &postburnin_per_run, &combined_postburnin))
-         done = 1;
+      current_pass = CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
+         fparam, round, target_samples, &rhat_pass, &ess_pass, &postburnin_per_run, &combined_postburnin);
       fclose(fparam);
+      consecutive_pass = (current_pass ? consecutive_pass + 1 : 0);
+      done = (consecutive_pass >= 3);
 
       fstats = zfopen("adaptive_stats.txt", "a");
-      fprintf(fstats, "%d\t%d\t%d\t%d\t%d\t%.8g\t%.8g\t%d\t%d\t%d\n",
+      fprintf(fstats, "%d\t%d\t%d\t%d\t%d\t%.8g\t%.8g\t%d\t%d\t%d\t%d\n",
          round, target_samples, burnin_samples, postburnin_per_run, combined_postburnin,
-         max_rhat, min_ess, rhat_pass, ess_pass, done);
+         max_rhat, min_ess, rhat_pass, ess_pass, consecutive_pass, done);
       fclose(fstats);
 
       printf("\nDiagnostics after %d samples/run: max Rhat = %.5f, min ESS = %.1f\n",
          target_samples, max_rhat, min_ess);
       if (done) {
-         printf("Stopping: convergence and ESS targets reached.\n");
+         printf("Stopping: convergence and ESS targets reached in 3 consecutive checks.\n");
          break;
       }
    }
