@@ -1322,13 +1322,13 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    for (j = 0, token = strtok(header_copy, " \t\r\n"); token && j < p; j++, token = strtok(NULL, " \t\r\n")) {
       strncpy(varname[j], token, 63);
       varname[j][63] = '\0';
-      if (strncmp(token, "t_n", 3) == 0) {
+      if (strncmp(token, "t_n", 3) == 0 || strcmp(token, "lnL") == 0) {
          check_col[j] = 1;
          ncheck++;
       }
    }
    if (ncheck == 0)
-      zerror("no t_n columns found for convergence/ESS checks");
+      zerror("no t_n or lnL columns found for convergence/ESS checks");
 
    *max_rhat = 0;
    *min_ess = 1e300;
