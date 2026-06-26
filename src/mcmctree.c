@@ -223,6 +223,7 @@ double PMat[16], Cijk[64], Root[4];
 double _rateSite = 1, OldAge = 999;
 int LASTROUND = 0, BayesEB, testlnL = 0, NPMat = 0; /* no use for this */
 int debug = 0;
+int AdaptiveChunkRun = 0;
 
 double BFbeta = 0;
 
@@ -344,6 +345,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
 #else
    int original_nsample = mcmc.nsample, target_samples, done = 0, round = 0, current_pass = 0, consecutive_pass = 0;
    int rhat_pass = 0, ess_pass = 0, postburnin_per_run = 0, combined_postburnin = 0;
+   int final_samples = 0, final_burnin_samples = 0;
    double max_rhat = 99, min_ess = 0;
    char combinedf[256] = "combined_mcmc.txt";
    FILE *fout, *fstats, *fparam;
@@ -386,16 +388,17 @@ int SetupAdaptiveParallelRuns(char cwd[])
       printf("\nAdaptive round %d: running each chain to %d samples.\n", round, target_samples);
       mcmc.nsample = target_samples;
       com.checkpoint = 3;
+      AdaptiveChunkRun = 1;
       if (SetupParallelRuns(cwd))
          return(1);
-
-      if (CombineRunsPostBurnin(combinedf, mcmc.nrun, burnin_samples))
-         zerror("failed to combine post-burnin MCMC samples");
+      AdaptiveChunkRun = 0;
 
       fparam = zfopen("adaptive_stats_by_parameter.txt", "a");
       current_pass = CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
          fparam, round, target_samples, &rhat_pass, &ess_pass, &postburnin_per_run, &combined_postburnin);
       fclose(fparam);
+      final_samples = target_samples;
+      final_burnin_samples = burnin_samples;
       consecutive_pass = (current_pass ? consecutive_pass + 1 : 0);
       done = (consecutive_pass >= 3);
 
@@ -418,12 +421,14 @@ int SetupAdaptiveParallelRuns(char cwd[])
          max_rhat, min_ess);
 
    mcmc.nsample = original_nsample;
+   if (CombineRunsPostBurnin(combinedf, mcmc.nrun, final_burnin_samples))
+      zerror("failed to combine final post-burnin MCMC samples");
    fout = zfopen("combined_out.txt", "w");
    fprintf(fout, "MCMCTREE combined summary (%s) %s\n", pamlVerStr, com.seqf);
    ReadTreeSeqs(fout);
    fprintf(fout, "\nAdaptive MCMC summary across %d independent runs\n", mcmc.nrun);
-   fprintf(fout, "burnin_per = %.4f  target_rhat = %.4f  target_ess = %d  max_samples = %d\n",
-      mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples);
+   fprintf(fout, "burnin_per = %.4f  target_rhat = %.4f  target_ess = %d  max_samples = %d  final_samples = %d\n",
+      mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples, final_samples);
    fprintf(fout, "Final diagnostics: max Rhat = %.5f  min ESS = %.1f\n", max_rhat, min_ess);
    DescriptiveStatisticsSimpleMCMCTREE(fout, combinedf);
    fclose(fout);
@@ -1293,7 +1298,7 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
 {
    char filename[256], header[100000];
    char *header_copy, *token, **varname;
-   double **run_data, *combined = NULL, *y, mean, var, rho1, W, B, grand, rhat, eff, ess;
+   double **run_data, *y, mean, var, rho1, W, B, grand, rhat, eff, ess;
    int *nr, *check_col, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
 
    run_data = (double**)malloc(nrun * sizeof(double*));
@@ -1304,9 +1309,8 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       ReadMCMCPostBurnin(filename, burnin_samples, &nr[irun], (irun == 0 ? &p : &p2), &run_data[irun], header, sizeof(header));
       if (irun && p2 != p) zerror("mcmc files have different columns");
       if (nr[irun] < 2) pass = 0;
+      ncombined += nr[irun];
    }
-   ReadMCMCPostBurnin(combinedf, 0, &ncombined, &p2, &combined, NULL, 0);
-   if (p2 != p) zerror("combined mcmc has different columns");
 
    check_col = (int*)malloc(p * sizeof(int));
    varname = (char**)malloc(p * sizeof(char*));
@@ -1375,8 +1379,10 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       rhat = (nmin > 1 && W > 0 ? sqrt(((nmin - 1.0) / nmin * W + B / nmin) / W) : 99);
       if (rhat > *max_rhat) *max_rhat = rhat;
       if (ncombined > 1) {
-         for (i = 0; i < ncombined; i++)
-            y[i] = combined[j*ncombined + i];
+         int k = 0;
+         for (irun = 0; irun < nrun; irun++)
+            for (i = 0; i < nr[irun]; i++)
+               y[k++] = run_data[irun][j*nr[irun] + i];
          eff = Eff_IntegratedCorrelationTime(y, ncombined, &mean, &var, &rho1);
          ess = ncombined * eff;
       }
@@ -1405,7 +1411,6 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       free(varname[j]);
    free(varname);
    free(header_copy);
-   free(combined);
    free(y);
    return(pass);
 }
@@ -5185,7 +5190,7 @@ int MCMC(FILE* fout)
       if (existing_samples >= target_samples) {
          printf("\nAutomatic resume: %s already has %d samples (target = %d records for nsample = %d).\n",
             com.mcmcf, existing_samples, target_samples, nsample_target);
-         if (mcmc.print) {
+         if (mcmc.print && !AdaptiveChunkRun) {
             if (mcmc.burninPer >= 0) {
                int burnin_samples = (int)(mcmc.nsample * mcmc.burninPer + 0.5);
                if (burnin_samples < 0) burnin_samples = 0;
@@ -5370,16 +5375,30 @@ int MCMC(FILE* fout)
       }
       
       /* save MCMC state */
-      if (com.checkpoint == 1 && k > 100 && ir > 0
+      if (!AdaptiveChunkRun && com.checkpoint == 1 && k > 100 && ir > 0
          && (ir + 1) % (int)(k * com.checkpointp) == 0)
          SaveMCMCstate(com.checkpointf, ir + (autoresume ? checkpoint_gen : 0), data.lnpR, lnL, nround, mx, mlnL);
    }  /* for(ir) */
 
    if (mcmc.print) fclose(fmcmc);
+
+   if (AdaptiveChunkRun && com.checkpoint == 1 && run_iterations > 0)
+      SaveMCMCstate(com.checkpointf, run_iterations - 1 + (autoresume ? checkpoint_gen : 0), data.lnpR, lnL, nround, mx, mlnL);
    
    if (BFbeta != 1) printf("\nBFbeta = %8.6f  E_b(lnf(X)) = %9.4f\n", BFbeta, mlnL);
    printf("\nTime used: %s", printtime(timestr));
    fprintf(fout, "\nTime used: %s", printtime(timestr));
+
+   if (AdaptiveChunkRun) {
+      free(x);
+      FreeMem();
+      printf("\ntime prior: %s\n", (data.priortime ? "beta" : "Birth-Death-Sampling"));
+      printf("rate prior: %s\n", (data.priorrate ? "gamma" : "Log-Normal"));
+      if (mcmc.usedata == 2 && data.transform)
+         printf("%s transform is used in approx like calculation.\n", Btransform[data.transform]);
+      printf("\nTime used: %s\n", printtime(timestr));
+      return(0);
+   }
 
    if (mcmc.burninPer >= 0) {
       int burnin_samples = (int)(mcmc.nsample * mcmc.burninPer + 0.5);
