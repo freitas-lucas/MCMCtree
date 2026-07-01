@@ -224,6 +224,9 @@ double _rateSite = 1, OldAge = 999;
 int LASTROUND = 0, BayesEB, testlnL = 0, NPMat = 0; /* no use for this */
 int debug = 0;
 int AdaptiveChunkRun = 0;
+#if(!defined _WIN32)
+int AdaptiveNotifyFD = -1, AdaptiveCommandFD = -1;
+#endif
 
 double BFbeta = 0;
 
@@ -266,6 +269,71 @@ int WriteSeedUsedFile(int seed)
    fclose(fseed);
    return(0);
 }
+
+#if(!defined _WIN32)
+int ReadFullFD(int fd, void *buf, size_t n)
+{
+   char *p = (char*)buf;
+   size_t done = 0;
+   ssize_t got;
+
+   while (done < n) {
+      got = read(fd, p + done, n - done);
+      if (got < 0) {
+         if (errno == EINTR) continue;
+         return(-1);
+      }
+      if (got == 0)
+         return(0);
+      done += (size_t)got;
+   }
+   return(1);
+}
+
+int WriteFullFD(int fd, const void *buf, size_t n)
+{
+   const char *p = (const char*)buf;
+   size_t done = 0;
+   ssize_t put;
+
+   while (done < n) {
+      put = write(fd, p + done, n - done);
+      if (put < 0) {
+         if (errno == EINTR) continue;
+         return(-1);
+      }
+      if (put == 0)
+         return(0);
+      done += (size_t)put;
+   }
+   return(1);
+}
+
+int AdaptiveWorkerPause(int target_samples)
+{
+   char command = 0;
+
+   if (AdaptiveNotifyFD < 0 || AdaptiveCommandFD < 0)
+      zerror("adaptive worker pipe is not initialized");
+   if (WriteFullFD(AdaptiveNotifyFD, &target_samples, sizeof(int)) != 1) {
+      printf("\nAdaptive worker failed to notify parent for chunk %d (fd %d, errno %d).\n",
+         target_samples, AdaptiveNotifyFD, errno);
+      zerror("failed to notify adaptive parent");
+   }
+   if (ReadFullFD(AdaptiveCommandFD, &command, sizeof(char)) != 1) {
+      printf("\nAdaptive worker failed to read parent command for chunk %d (fd %d, errno %d).\n",
+         target_samples, AdaptiveCommandFD, errno);
+      zerror("failed to read adaptive parent command");
+   }
+   return(command == 'S');
+}
+
+void CloseUnlessKept(int fd, int keep1, int keep2, int keep3, int keep4)
+{
+   if (fd >= 0 && fd != keep1 && fd != keep2 && fd != keep3 && fd != keep4)
+      close(fd);
+}
+#endif
 
 int SetupParallelRuns(char cwd[])
 {
@@ -343,12 +411,16 @@ int SetupAdaptiveParallelRuns(char cwd[])
    zerror("adaptive n_runs is not supported on Windows");
    return(0);
 #else
-   int original_nsample = mcmc.nsample, target_samples, done = 0, round = 0, current_pass = 0, consecutive_pass = 0;
+   int original_nsample = mcmc.nsample, original_burnin = mcmc.burnin, original_checkpoint = com.checkpoint;
+   int target_samples, done = 0, round = 0, current_pass = 0, consecutive_pass = 0;
    int rhat_pass = 0, ess_pass = 0, postburnin_per_run = 0, combined_postburnin = 0;
-   int final_samples = 0, final_burnin_samples = 0;
+   int final_samples = 0, final_burnin_samples = 0, irun, status, failed = 0, seed;
    double max_rhat = 99, min_ess = 0;
    char combinedf[256] = "combined_mcmc.txt";
+   char rundir[64], command;
    FILE *fout, *fstats, *fparam;
+   pid_t *pids;
+   int (*to_parent)[2], (*to_child)[2];
 
    if (mcmc.nrun < 2)
       zerror("adaptive MCMC needs n_runs > 1");
@@ -369,7 +441,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
    printf("\nAdaptive MCMC with %d independent runs.\n", mcmc.nrun);
    printf("chunk_size = %d, burnin_per = %.4f, target_rhat = %.4f, target_ess = %d, max_samples = %d\n",
       mcmc.chunkSize, mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples);
-   mcmc.burnin = 0;
+   printf("Persistent adaptive workers: each run reads input files once and pauses at chunk boundaries.\n");
 
    fstats = zfopen("adaptive_stats.txt", "w");
    fprintf(fstats, "chunk\tsamples_per_run\tburnin_samples\tpostburnin_per_run\tcombined_postburnin_samples\tmax_rhat\tmin_ess\trhat_pass\tess_pass\tconsecutive_pass\tstop\n");
@@ -378,6 +450,69 @@ int SetupAdaptiveParallelRuns(char cwd[])
    fprintf(fparam, "chunk\tsamples_per_run\tburnin_samples\tparameter\trhat\tess\trhat_pass\tess_pass\n");
    fclose(fparam);
 
+   pids = (pid_t*)malloc(mcmc.nrun * sizeof(pid_t));
+   to_parent = (int(*)[2])malloc(mcmc.nrun * sizeof(int[2]));
+   to_child = (int(*)[2])malloc(mcmc.nrun * sizeof(int[2]));
+   if (pids == NULL || to_parent == NULL || to_child == NULL)
+      zerror("oom adaptive worker pipes");
+
+   remove("SeedUsed");
+   fflush(NULL);
+   for (irun = 0; irun < mcmc.nrun; irun++) {
+      sprintf(rundir, "run%d", irun + 1);
+      if (mkdir(rundir, 0777) && errno != EEXIST)
+         zerror("failed to create run directory");
+      if (pipe(to_parent[irun]) || pipe(to_child[irun]))
+         zerror("failed to create adaptive worker pipe");
+
+      pids[irun] = fork();
+      if (pids[irun] < 0)
+         zerror("fork failed");
+      if (pids[irun] == 0) {
+         int jrun, resume_from_checkpoint;
+         int keep1 = to_parent[irun][0], keep2 = to_parent[irun][1];
+         int keep3 = to_child[irun][0], keep4 = to_child[irun][1];
+
+         for (jrun = 0; jrun < irun; jrun++) {
+            CloseUnlessKept(to_parent[jrun][0], keep1, keep2, keep3, keep4);
+            CloseUnlessKept(to_parent[jrun][1], keep1, keep2, keep3, keep4);
+            CloseUnlessKept(to_child[jrun][0], keep1, keep2, keep3, keep4);
+            CloseUnlessKept(to_child[jrun][1], keep1, keep2, keep3, keep4);
+         }
+         close(to_parent[irun][0]);
+         close(to_child[irun][1]);
+         AdaptiveNotifyFD = to_parent[irun][1];
+         AdaptiveCommandFD = to_child[irun][0];
+         AdaptiveChunkRun = 1;
+         mcmc.burnin = 0;
+         mcmc.nsample = mcmc.maxSamples;
+         com.checkpoint = 3;
+
+         if (chdir(rundir))
+            zerror("failed to enter run directory");
+         resume_from_checkpoint = ((original_checkpoint == 2 || original_checkpoint == 3)
+            && FileExists(com.checkpointf));
+         if (!resume_from_checkpoint) {
+            seed = (mcmc.seed <= 0 ? -1 : mcmc.seed + irun);
+            SetSeed(seed, seed <= 0);
+            if (seed > 0)
+               WriteSeedUsedFile(seed);
+         }
+         else {
+            printf("\n[run%d] Found %s; preserving SeedUsed and restoring RNG from checkpoint.\n",
+               irun + 1, com.checkpointf);
+         }
+         printf("\n[run%d] Writing results in %s/%s\n", irun + 1, cwd, rundir);
+         free(pids);
+         free(to_parent);
+         free(to_child);
+         return(1);
+      }
+
+      close(to_parent[irun][1]);
+      close(to_child[irun][0]);
+   }
+
    for (target_samples = mcmc.chunkSize; target_samples <= mcmc.maxSamples; target_samples += mcmc.chunkSize) {
       int burnin_samples = (int)(target_samples * mcmc.burninPer + 0.5);
 
@@ -385,13 +520,19 @@ int SetupAdaptiveParallelRuns(char cwd[])
       if (burnin_samples < 0) burnin_samples = 0;
       if (burnin_samples >= target_samples) burnin_samples = target_samples - 1;
 
-      printf("\nAdaptive round %d: running each chain to %d samples.\n", round, target_samples);
-      mcmc.nsample = target_samples;
-      com.checkpoint = 3;
-      AdaptiveChunkRun = 1;
-      if (SetupParallelRuns(cwd))
-         return(1);
-      AdaptiveChunkRun = 0;
+      printf("\nAdaptive round %d: waiting for each chain to reach %d samples.\n", round, target_samples);
+      for (irun = 0; irun < mcmc.nrun; irun++) {
+         int worker_samples = 0;
+         if (ReadFullFD(to_parent[irun][0], &worker_samples, sizeof(int)) != 1) {
+            failed = 1;
+            break;
+         }
+         if (worker_samples != target_samples)
+            printf("\n[run%d] reached %d samples while parent expected %d.\n",
+               irun + 1, worker_samples, target_samples);
+      }
+      if (failed)
+         break;
 
       fparam = zfopen("adaptive_stats_by_parameter.txt", "a");
       current_pass = CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
@@ -412,15 +553,39 @@ int SetupAdaptiveParallelRuns(char cwd[])
          target_samples, max_rhat, min_ess);
       if (done) {
          printf("Stopping: convergence and ESS targets reached in 3 consecutive checks.\n");
-         break;
       }
+      command = (done || target_samples + mcmc.chunkSize > mcmc.maxSamples ? 'S' : 'C');
+      for (irun = 0; irun < mcmc.nrun; irun++)
+         if (WriteFullFD(to_child[irun][1], &command, sizeof(char)) != 1)
+            failed = 1;
+      if (done || failed)
+         break;
    }
+
+   for (irun = 0; irun < mcmc.nrun; irun++) {
+      close(to_parent[irun][0]);
+      close(to_child[irun][1]);
+   }
+   for (irun = 0; irun < mcmc.nrun; irun++) {
+      if (waitpid(pids[irun], &status, 0) < 0)
+         failed = 1;
+      else if (!WIFEXITED(status) || WEXITSTATUS(status))
+         failed = 1;
+   }
+   free(pids);
+   free(to_parent);
+   free(to_child);
+
+   if (failed)
+      zerror("one or more adaptive MCMC workers failed");
 
    if (!done)
       printf("\nWarning: max_samples reached before convergence/ESS targets. max Rhat = %.5f, min ESS = %.1f\n",
          max_rhat, min_ess);
 
    mcmc.nsample = original_nsample;
+   mcmc.burnin = original_burnin;
+   com.checkpoint = original_checkpoint;
    if (CombineRunsPostBurnin(combinedf, mcmc.nrun, final_burnin_samples))
       zerror("failed to combine final post-burnin MCMC samples");
    fout = zfopen("combined_out.txt", "w");
@@ -5135,6 +5300,7 @@ int MCMC(FILE* fout)
    int ignored_samples = 0, checkpoint_gen = 0, progress_gen = 0, progress_total = 0;
    int target_samples = 0, sample_now = 0, run_iterations = 0;
    int restored_checkpoint_stats = 0;
+   int adaptive_next_samples = 0, adaptive_next_records = 0, adaptive_stop = 0, total_records = 0;
    double lnL = 0, mlnL = 0, nround = 0, *x, *mx, postEFossil[MaxNFossils] = { 0 };
    double au = data.rgenepara[0], bu = data.rgenepara[1], a = data.rgenepara[2];
    char timestr[36];
@@ -5190,6 +5356,17 @@ int MCMC(FILE* fout)
       if (existing_samples >= target_samples) {
          printf("\nAutomatic resume: %s already has %d samples (target = %d records for nsample = %d).\n",
             com.mcmcf, existing_samples, target_samples, nsample_target);
+         if (AdaptiveChunkRun) {
+#if(!defined _WIN32)
+            for (adaptive_next_samples = mcmc.chunkSize;
+               adaptive_next_samples <= mcmc.maxSamples
+               && adaptive_next_samples + (mcmc.sampfreq > 1) <= existing_samples;
+               adaptive_next_samples += mcmc.chunkSize) {
+               if (AdaptiveWorkerPause(adaptive_next_samples))
+                  break;
+            }
+#endif
+         }
          if (mcmc.print && !AdaptiveChunkRun) {
             if (mcmc.burninPer >= 0) {
                int burnin_samples = (int)(mcmc.nsample * mcmc.burninPer + 0.5);
@@ -5225,6 +5402,21 @@ int MCMC(FILE* fout)
          fmcmc = zfopen(com.mcmcf, "w");
    }
    collectx(autoresume ? NULL : fmcmc, x);
+   if (AdaptiveChunkRun) {
+      adaptive_next_samples = mcmc.chunkSize;
+      adaptive_next_records = adaptive_next_samples + (mcmc.sampfreq > 1);
+#if(!defined _WIN32)
+      while (autoresume && adaptive_next_samples <= mcmc.maxSamples
+         && adaptive_next_records <= existing_samples) {
+         if (AdaptiveWorkerPause(adaptive_next_samples)) {
+            adaptive_stop = 1;
+            break;
+         }
+         adaptive_next_samples += mcmc.chunkSize;
+         adaptive_next_records = adaptive_next_samples + (mcmc.sampfreq > 1);
+      }
+#endif
+   }
    if (!com.fix_kappa && !com.fix_alpha && data.ngene == 2) { nxpr[0] = 6; nxpr[1] = 4; }
 
    puts("\npriors: ");
@@ -5286,7 +5478,7 @@ int MCMC(FILE* fout)
       zero(mx, com.np);
    if (com.np < nxpr[0] + nxpr[1]) { nxpr[0] = com.np; nxpr[1] = 0; }
    run_iterations = (autoresume ? progress_total - checkpoint_gen : mcmc.sampfreq*mcmc.nsample);
-   for (ir = -mcmc.burnin; ir < run_iterations; ir++) {
+   for (ir = -mcmc.burnin; ir < run_iterations && !adaptive_stop; ir++) {
       if (((!autoresume || !restored_checkpoint_stats) && ir == 0)
          || (nround >= 100 && mcmc.burnin >= 200 && ir < 0 && ir % (mcmc.burnin / 5) == 0)) {
          if (mcmc.burnin >= 200)
@@ -5345,6 +5537,18 @@ int MCMC(FILE* fout)
          fprintf(fmcmc, "\n");
          fflush(fmcmc);
          samples_this_run++;
+         if (AdaptiveChunkRun) {
+            total_records = existing_samples + samples_this_run;
+            if (adaptive_next_samples <= mcmc.maxSamples && total_records >= adaptive_next_records) {
+               if (com.checkpoint == 1)
+                  SaveMCMCstate(com.checkpointf, ir + (autoresume ? checkpoint_gen : 0), data.lnpR, lnL, nround, mx, mlnL);
+#if(!defined _WIN32)
+               adaptive_stop = AdaptiveWorkerPause(adaptive_next_samples);
+#endif
+               adaptive_next_samples += mcmc.chunkSize;
+               adaptive_next_records = adaptive_next_samples + (mcmc.sampfreq > 1);
+            }
+         }
       }
       if ((ir + 1) % max2(mcmc.sampfreq, progress_total / 100) == 0) {
          progress_gen = ir + 1 + (autoresume ? checkpoint_gen : 0);
@@ -5382,9 +5586,6 @@ int MCMC(FILE* fout)
 
    if (mcmc.print) fclose(fmcmc);
 
-   if (AdaptiveChunkRun && com.checkpoint == 1 && run_iterations > 0)
-      SaveMCMCstate(com.checkpointf, run_iterations - 1 + (autoresume ? checkpoint_gen : 0), data.lnpR, lnL, nround, mx, mlnL);
-   
    if (BFbeta != 1) printf("\nBFbeta = %8.6f  E_b(lnf(X)) = %9.4f\n", BFbeta, mlnL);
    printf("\nTime used: %s", printtime(timestr));
    fprintf(fout, "\nTime used: %s", printtime(timestr));
