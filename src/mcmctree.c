@@ -1389,6 +1389,57 @@ int ReadMCMCPostBurnin(char filename[], int burnin_samples, int *n, int *p, doub
    return(0);
 }
 
+int ReadMCMCColumnsPostBurnin(char filename[], int burnin_samples, int expected_cols, int ncols, int cols[], int *n, double **data)
+{
+   FILE *fin = zfopen(filename, "r");
+   char *line, *endp;
+   int lline = 1000000, nrow = 0, cap = 1024, i, j, k;
+   double *x, *xnew, v;
+
+   line = (char*)malloc(lline * sizeof(char));
+   if (line == NULL) zerror("oom line in ReadMCMCColumnsPostBurnin");
+   if (fgets(line, lline, fin) == NULL)
+      zerror("empty mcmc file");
+   if (CountFields(line) != expected_cols)
+      zerror("mcmc files have different columns");
+
+   x = (double*)malloc((size_t)cap * ncols * sizeof(double));
+   if (x == NULL) zerror("oom data in ReadMCMCColumnsPostBurnin");
+
+   for (i = 0; fgets(line, lline, fin); i++) {
+      if (i < burnin_samples) continue;
+      if (CountFields(line) != expected_cols) continue;
+      if (nrow >= cap) {
+         int oldcap = cap;
+         cap *= 2;
+         xnew = (double*)malloc((size_t)cap * ncols * sizeof(double));
+         if (xnew == NULL) zerror("oom realloc data in ReadMCMCColumnsPostBurnin");
+         for (j = 0; j < ncols; j++)
+            memcpy(xnew + j*cap, x + j*oldcap, nrow * sizeof(double));
+         free(x);
+         x = xnew;
+      }
+      endp = line;
+      for (j = k = 0; j < expected_cols; j++) {
+         v = strtod(endp, &endp);
+         if (k < ncols && j == cols[k])
+            x[k++*cap + nrow] = v;
+      }
+      nrow++;
+   }
+   fclose(fin);
+   free(line);
+
+   *data = (double*)malloc((size_t)nrow * ncols * sizeof(double));
+   if (*data == NULL && nrow*ncols > 0) zerror("oom compact data in ReadMCMCColumnsPostBurnin");
+   for (j = 0; j < ncols; j++)
+      for (i = 0; i < nrow; i++)
+         (*data)[j*nrow + i] = x[j*cap + i];
+   free(x);
+   *n = nrow;
+   return(0);
+}
+
 int CreatePostBurninMCMCFile(char infile[], char outfile[], int burnin_samples)
 {
    FILE *fin = zfopen(infile, "r"), *fout = zfopen(outfile, "w");
@@ -1464,23 +1515,25 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    char filename[256], header[100000];
    char *header_copy, *token, **varname;
    double **run_data, *y, mean, var, rho1, W, B, grand, rhat, eff, ess;
-   int *nr, *check_col, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
+   int *nr, *check_col, *cols, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
+   FILE *fin;
 
    run_data = (double**)malloc(nrun * sizeof(double*));
    nr = (int*)malloc(nrun * sizeof(int));
    if (run_data == NULL || nr == NULL) zerror("oom in CheckConvergenceESS");
-   for (irun = 0; irun < nrun; irun++) {
-      sprintf(filename, "run%d/%s", irun + 1, com.mcmcf);
-      ReadMCMCPostBurnin(filename, burnin_samples, &nr[irun], (irun == 0 ? &p : &p2), &run_data[irun], header, sizeof(header));
-      if (irun && p2 != p) zerror("mcmc files have different columns");
-      if (nr[irun] < 2) pass = 0;
-      ncombined += nr[irun];
-   }
+
+   sprintf(filename, "run1/%s", com.mcmcf);
+   fin = zfopen(filename, "r");
+   if (fgets(header, sizeof(header), fin) == NULL)
+      zerror("empty mcmc file");
+   fclose(fin);
+   p = CountFields(header);
 
    check_col = (int*)malloc(p * sizeof(int));
    varname = (char**)malloc(p * sizeof(char*));
+   cols = (int*)malloc(p * sizeof(int));
    header_copy = (char*)malloc((strlen(header) + 1) * sizeof(char));
-   if (check_col == NULL || varname == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
+   if (check_col == NULL || varname == NULL || cols == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
    memset(check_col, 0, p * sizeof(int));
    for (j = 0; j < p; j++) {
       varname[j] = (char*)malloc(64 * sizeof(char));
@@ -1492,12 +1545,27 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       strncpy(varname[j], token, 63);
       varname[j][63] = '\0';
       if (strncmp(token, "t_n", 3) == 0 || strcmp(token, "lnL") == 0) {
-         check_col[j] = 1;
+         check_col[ncheck] = j;
+         strcpy(varname[ncheck], varname[j]);
+         cols[ncheck] = j;
          ncheck++;
       }
    }
    if (ncheck == 0)
       zerror("no t_n or lnL columns found for convergence/ESS checks");
+
+   for (irun = 0; irun < nrun; irun++) {
+      sprintf(filename, "run%d/%s", irun + 1, com.mcmcf);
+      fin = zfopen(filename, "r");
+      if (fgets(header, sizeof(header), fin) == NULL)
+         zerror("empty mcmc file");
+      p2 = CountFields(header);
+      fclose(fin);
+      if (p2 != p) zerror("mcmc files have different columns");
+      ReadMCMCColumnsPostBurnin(filename, burnin_samples, p, ncheck, cols, &nr[irun], &run_data[irun]);
+      if (nr[irun] < 2) pass = 0;
+      ncombined += nr[irun];
+   }
 
    *max_rhat = 0;
    *min_ess = 1e300;
@@ -1516,10 +1584,8 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       *ess_pass = 0;
    }
 
-   for (j = 1; j < p; j++) {
+   for (j = 0; j < ncheck; j++) {
       double *means, *vars;
-      if (!check_col[j])
-         continue;
 
       means = (double*)malloc(nrun * sizeof(double));
       vars = (double*)malloc(nrun * sizeof(double));
@@ -1572,6 +1638,7 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    free(run_data);
    free(nr);
    free(check_col);
+   free(cols);
    for (j = 0; j < p; j++)
       free(varname[j]);
    free(varname);
