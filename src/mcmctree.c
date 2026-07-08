@@ -228,6 +228,9 @@ int AdaptiveChunkRun = 0;
 int AdaptiveNotifyFD = -1, AdaptiveCommandFD = -1;
 #endif
 
+#define ADAPTIVE_DIAG_FILE "adaptive_diag.bin"
+#define ADAPTIVE_DIAG_MAGIC "PAMLADG1"
+
 double BFbeta = 0;
 
 /* for stree.nodes[].fossil: lower, upper, bounds, gamma, inverse-gamma */
@@ -1389,11 +1392,11 @@ int ReadMCMCPostBurnin(char filename[], int burnin_samples, int *n, int *p, doub
    return(0);
 }
 
-int ReadMCMCColumnsPostBurnin(char filename[], int burnin_samples, int expected_cols, int ncols, int cols[], int *n, double **data)
+int ReadMCMCColumnsPostBurnin(char filename[], int burnin_samples, int max_records, int expected_cols, int ncols, int cols[], int *n, double **data)
 {
    FILE *fin = zfopen(filename, "r");
    char *line, *endp;
-   int lline = 1000000, nrow = 0, cap = 1024, i, j, k;
+   int lline = 1000000, nrow = 0, cap = 1024, i, j, k, nseen = 0;
    double *x, *xnew, v;
 
    line = (char*)malloc(lline * sizeof(char));
@@ -1407,8 +1410,9 @@ int ReadMCMCColumnsPostBurnin(char filename[], int burnin_samples, int expected_
    if (x == NULL) zerror("oom data in ReadMCMCColumnsPostBurnin");
 
    for (i = 0; fgets(line, lline, fin); i++) {
-      if (i < burnin_samples) continue;
       if (CountFields(line) != expected_cols) continue;
+      if (max_records > 0 && nseen >= max_records) break;
+      if (nseen++ < burnin_samples) continue;
       if (nrow >= cap) {
          int oldcap = cap;
          cap *= 2;
@@ -1436,6 +1440,174 @@ int ReadMCMCColumnsPostBurnin(char filename[], int burnin_samples, int expected_
       for (i = 0; i < nrow; i++)
          (*data)[j*nrow + i] = x[j*cap + i];
    free(x);
+   *n = nrow;
+   return(0);
+}
+
+int WriteAdaptiveDiagHeader(FILE *fdiag, int ncols)
+{
+   char magic[8] = ADAPTIVE_DIAG_MAGIC;
+
+   if (fwrite(magic, 1, 8, fdiag) != 8)
+      zerror("failed to write adaptive diagnostic cache header");
+   if (fwrite(&ncols, sizeof(int), 1, fdiag) != 1)
+      zerror("failed to write adaptive diagnostic cache columns");
+   return(0);
+}
+
+int ReadAdaptiveDiagHeader(FILE *fdiag, int *ncols)
+{
+   char magic[8], expected[8] = ADAPTIVE_DIAG_MAGIC;
+
+   if (fread(magic, 1, 8, fdiag) != 8)
+      return(-1);
+   if (memcmp(magic, expected, 8))
+      return(-1);
+   if (fread(ncols, sizeof(int), 1, fdiag) != 1)
+      return(-1);
+   return(0);
+}
+
+int AdaptiveDiagSampleCount(char filename[], int expected_ncols)
+{
+   FILE *fdiag = (FILE*)fopen(filename, "rb");
+   long size, header_size = 8 + (long)sizeof(int), record_size;
+   int ncols = 0;
+
+   if (fdiag == NULL)
+      return(-1);
+   if (ReadAdaptiveDiagHeader(fdiag, &ncols) || ncols != expected_ncols) {
+      fclose(fdiag);
+      return(-1);
+   }
+   if (fseek(fdiag, 0, SEEK_END)) {
+      fclose(fdiag);
+      return(-1);
+   }
+   size = ftell(fdiag);
+   fclose(fdiag);
+   record_size = (long)ncols * (long)sizeof(double);
+   if (size < header_size || record_size <= 0 || (size - header_size) % record_size)
+      return(-1);
+   return((int)((size - header_size) / record_size));
+}
+
+int RebuildAdaptiveDiagCacheFromMCMC(char cachefile[], char mcmcfile[], int expected_fields, int expected_samples, int ncols)
+{
+   FILE *fin = zfopen(mcmcfile, "r"), *fdiag = zfopen(cachefile, "wb");
+   char *line, *endp;
+   int lline = 1000000, nrow = 0, i, j, ntime = stree.nspecies - 1, nf;
+   double v;
+
+   line = (char*)malloc(lline * sizeof(char));
+   if (line == NULL) zerror("oom line in RebuildAdaptiveDiagCacheFromMCMC");
+   if (fgets(line, lline, fin) == NULL)
+      zerror("empty mcmc file while rebuilding adaptive diagnostic cache");
+   if (CountFields(line) != expected_fields)
+      zerror("mcmc files have different columns while rebuilding adaptive diagnostic cache");
+
+   WriteAdaptiveDiagHeader(fdiag, ncols);
+   while (nrow < expected_samples && fgets(line, lline, fin)) {
+      nf = CountFields(line);
+      if (nf != expected_fields) continue;
+      endp = line;
+      for (i = j = 0; i < expected_fields; i++) {
+         v = strtod(endp, &endp);
+         if (i >= 1 && i <= ntime) {
+            fwrite(&v, sizeof(double), 1, fdiag);
+            j++;
+         }
+         else if (mcmc.usedata && i == expected_fields - 1) {
+            fwrite(&v, sizeof(double), 1, fdiag);
+            j++;
+         }
+      }
+      if (j != ncols)
+         zerror("adaptive diagnostic cache column mismatch");
+      nrow++;
+   }
+   fclose(fin);
+   fclose(fdiag);
+   free(line);
+   if (nrow != expected_samples)
+      zerror("adaptive diagnostic cache rebuild did not match mcmc sample count");
+   return(nrow);
+}
+
+FILE *OpenAdaptiveDiagCache(int autoresume, int existing_samples, int expected_fields, int ncols)
+{
+   FILE *fdiag;
+   int cached_samples;
+
+   if (autoresume) {
+      cached_samples = AdaptiveDiagSampleCount(ADAPTIVE_DIAG_FILE, ncols);
+      if (cached_samples != existing_samples)
+         RebuildAdaptiveDiagCacheFromMCMC(ADAPTIVE_DIAG_FILE, com.mcmcf, expected_fields, existing_samples, ncols);
+      fdiag = zfopen(ADAPTIVE_DIAG_FILE, "ab");
+   }
+   else {
+      fdiag = zfopen(ADAPTIVE_DIAG_FILE, "wb");
+      WriteAdaptiveDiagHeader(fdiag, ncols);
+   }
+   return(fdiag);
+}
+
+int WriteAdaptiveDiagSample(FILE *fdiag, double x[], double lnL)
+{
+   int j, ntime = stree.nspecies - 1;
+   double v;
+
+   if (fdiag == NULL)
+      return(0);
+   for (j = 0; j < ntime; j++) {
+      v = (x[j] >= 0 ? floor(x[j] * 1e7 + 0.5) : ceil(x[j] * 1e7 - 0.5)) / 1e7;
+      if (fwrite(&v, sizeof(double), 1, fdiag) != 1)
+         zerror("failed to write adaptive diagnostic sample");
+   }
+   if (mcmc.usedata) {
+      v = lnL / BFbeta;
+      v = (v >= 0 ? floor(v * 1e3 + 0.5) : ceil(v * 1e3 - 0.5)) / 1e3;
+      if (fwrite(&v, sizeof(double), 1, fdiag) != 1)
+         zerror("failed to write adaptive diagnostic lnL");
+   }
+   return(0);
+}
+
+int ReadAdaptiveDiagPostBurnin(char filename[], int burnin_samples, int max_records, int expected_ncols, int *n, double **data)
+{
+   FILE *fdiag = zfopen(filename, "rb");
+   long size, header_size = 8 + (long)sizeof(int), record_size;
+   int ncols = 0, ntotal, nused, nrow, i, j;
+   double *row;
+
+   if (ReadAdaptiveDiagHeader(fdiag, &ncols) || ncols != expected_ncols)
+      zerror("adaptive diagnostic cache has wrong format");
+   if (fseek(fdiag, 0, SEEK_END))
+      zerror("failed to seek adaptive diagnostic cache");
+   size = ftell(fdiag);
+   record_size = (long)ncols * (long)sizeof(double);
+   if (size < header_size || record_size <= 0 || (size - header_size) % record_size)
+      zerror("adaptive diagnostic cache is truncated");
+   ntotal = (int)((size - header_size) / record_size);
+   nused = (max_records > 0 && max_records < ntotal ? max_records : ntotal);
+   if (burnin_samples < 0) burnin_samples = 0;
+   if (burnin_samples > nused) burnin_samples = nused;
+   nrow = nused - burnin_samples;
+
+   *data = (double*)malloc((size_t)nrow * ncols * sizeof(double));
+   row = (double*)malloc(ncols * sizeof(double));
+   if ((*data == NULL && nrow*ncols > 0) || row == NULL)
+      zerror("oom data in ReadAdaptiveDiagPostBurnin");
+   if (fseek(fdiag, header_size + (long)burnin_samples * record_size, SEEK_SET))
+      zerror("failed to seek adaptive diagnostic records");
+   for (i = 0; i < nrow; i++) {
+      if (fread(row, sizeof(double), ncols, fdiag) != (size_t)ncols)
+         zerror("failed to read adaptive diagnostic record");
+      for (j = 0; j < ncols; j++)
+         (*data)[j*nrow + i] = row[j];
+   }
+   fclose(fdiag);
+   free(row);
    *n = nrow;
    return(0);
 }
@@ -1562,7 +1734,13 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       p2 = CountFields(header);
       fclose(fin);
       if (p2 != p) zerror("mcmc files have different columns");
-      ReadMCMCColumnsPostBurnin(filename, burnin_samples, p, ncheck, cols, &nr[irun], &run_data[irun]);
+      sprintf(filename, "run%d/%s", irun + 1, ADAPTIVE_DIAG_FILE);
+      if (FileExists(filename))
+         ReadAdaptiveDiagPostBurnin(filename, burnin_samples, samples_per_run + (mcmc.sampfreq > 1), ncheck, &nr[irun], &run_data[irun]);
+      else {
+         sprintf(filename, "run%d/%s", irun + 1, com.mcmcf);
+         ReadMCMCColumnsPostBurnin(filename, burnin_samples, samples_per_run + (mcmc.sampfreq > 1), p, ncheck, cols, &nr[irun], &run_data[irun]);
+      }
       if (nr[irun] < 2) pass = 0;
       ncombined += nr[irun];
    }
@@ -5360,7 +5538,7 @@ int DescriptiveStatisticsSimpleMCMCTREE(FILE *fout, char infile[])
 
 int MCMC(FILE* fout)
 {
-   FILE *fmcmc = NULL;
+   FILE *fmcmc = NULL, *fdiag = NULL;
    int nxpr[2] = { 6, 2 }, i, j, k, ir, g = data.ngene;
    int autoresume = 0, existing_samples = 0, remaining_samples = 0, nsample_target = 0;
    int lastgen = 0, igen = 0, expected_fields = 0, samples_this_run = 0, saved_ir = 0;
@@ -5368,6 +5546,7 @@ int MCMC(FILE* fout)
    int target_samples = 0, sample_now = 0, run_iterations = 0;
    int restored_checkpoint_stats = 0;
    int adaptive_next_samples = 0, adaptive_next_records = 0, adaptive_stop = 0, total_records = 0;
+   int adaptive_diag_ncols = 0;
    double lnL = 0, mlnL = 0, nround = 0, *x, *mx, postEFossil[MaxNFossils] = { 0 };
    double au = data.rgenepara[0], bu = data.rgenepara[1], a = data.rgenepara[2];
    char timestr[36];
@@ -5470,6 +5649,8 @@ int MCMC(FILE* fout)
    }
    collectx(autoresume ? NULL : fmcmc, x);
    if (AdaptiveChunkRun) {
+      adaptive_diag_ncols = stree.nspecies - 1 + (mcmc.usedata ? 1 : 0);
+      fdiag = OpenAdaptiveDiagCache(autoresume, existing_samples, expected_fields, adaptive_diag_ncols);
       adaptive_next_samples = mcmc.chunkSize;
       adaptive_next_records = adaptive_next_samples + (mcmc.sampfreq > 1);
 #if(!defined _WIN32)
@@ -5603,10 +5784,12 @@ int MCMC(FILE* fout)
          if (mcmc.usedata) fprintf(fmcmc, "\t%.3f", lnL / BFbeta);
          fprintf(fmcmc, "\n");
          fflush(fmcmc);
+         WriteAdaptiveDiagSample(fdiag, x, lnL);
          samples_this_run++;
          if (AdaptiveChunkRun) {
             total_records = existing_samples + samples_this_run;
             if (adaptive_next_samples <= mcmc.maxSamples && total_records >= adaptive_next_records) {
+               if (fdiag) fflush(fdiag);
                if (com.checkpoint == 1)
                   SaveMCMCstate(com.checkpointf, ir + (autoresume ? checkpoint_gen : 0), data.lnpR, lnL, nround, mx, mlnL);
 #if(!defined _WIN32)
@@ -5652,6 +5835,7 @@ int MCMC(FILE* fout)
    }  /* for(ir) */
 
    if (mcmc.print) fclose(fmcmc);
+   if (fdiag) fclose(fdiag);
 
    if (BFbeta != 1) printf("\nBFbeta = %8.6f  E_b(lnf(X)) = %9.4f\n", BFbeta, mlnL);
    printf("\nTime used: %s", printtime(timestr));
