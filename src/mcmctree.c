@@ -547,13 +547,22 @@ int SetupAdaptiveParallelRuns(char cwd[])
       done = (consecutive_pass >= 3);
 
       fstats = zfopen("adaptive_stats.txt", "a");
-      fprintf(fstats, "%d\t%d\t%d\t%d\t%d\t%.8g\t%.8g\t%d\t%d\t%d\t%d\n",
-         round, target_samples, burnin_samples, postburnin_per_run, combined_postburnin,
-         max_rhat, min_ess, rhat_pass, ess_pass, consecutive_pass, done);
+      if (min_ess < 0)
+         fprintf(fstats, "%d\t%d\t%d\t%d\t%d\t%.8g\t\t%d\t%d\t%d\t%d\n",
+            round, target_samples, burnin_samples, postburnin_per_run, combined_postburnin,
+            max_rhat, rhat_pass, ess_pass, consecutive_pass, done);
+      else
+         fprintf(fstats, "%d\t%d\t%d\t%d\t%d\t%.8g\t%.8g\t%d\t%d\t%d\t%d\n",
+            round, target_samples, burnin_samples, postburnin_per_run, combined_postburnin,
+            max_rhat, min_ess, rhat_pass, ess_pass, consecutive_pass, done);
       fclose(fstats);
 
-      printf("\nDiagnostics after %d samples/run: max Rhat = %.5f, min ESS = %.1f\n",
-         target_samples, max_rhat, min_ess);
+      if (min_ess < 0)
+         printf("\nDiagnostics after %d samples/run: max Rhat = %.5f, ESS skipped because Rhat failed\n",
+            target_samples, max_rhat);
+      else
+         printf("\nDiagnostics after %d samples/run: max Rhat = %.5f, min ESS = %.1f\n",
+            target_samples, max_rhat, min_ess);
       if (done) {
          printf("Stopping: convergence and ESS targets reached in 3 consecutive checks.\n");
       }
@@ -582,9 +591,14 @@ int SetupAdaptiveParallelRuns(char cwd[])
    if (failed)
       zerror("one or more adaptive MCMC workers failed");
 
-   if (!done)
-      printf("\nWarning: max_samples reached before convergence/ESS targets. max Rhat = %.5f, min ESS = %.1f\n",
-         max_rhat, min_ess);
+   if (!done) {
+      if (min_ess < 0)
+         printf("\nWarning: max_samples reached before convergence/ESS targets. max Rhat = %.5f, ESS skipped because Rhat failed\n",
+            max_rhat);
+      else
+         printf("\nWarning: max_samples reached before convergence/ESS targets. max Rhat = %.5f, min ESS = %.1f\n",
+            max_rhat, min_ess);
+   }
 
    mcmc.nsample = original_nsample;
    mcmc.burnin = original_burnin;
@@ -1686,7 +1700,7 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
 {
    char filename[256], header[100000];
    char *header_copy, *token, **varname;
-   double **run_data, *y, mean, var, rho1, W, B, grand, rhat, eff, ess;
+   double **run_data, *y = NULL, *rhats, mean, var, rho1, W, B, grand, rhat, eff, ess;
    int *nr, *check_col, *cols, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
    FILE *fin;
 
@@ -1749,8 +1763,8 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    *min_ess = 1e300;
    *rhat_pass = 1;
    *ess_pass = 1;
-   y = (double*)malloc(ncombined * sizeof(double));
-   if (y == NULL) zerror("oom y in CheckConvergenceESS");
+   rhats = (double*)malloc(ncheck * sizeof(double));
+   if (rhats == NULL) zerror("oom rhats in CheckConvergenceESS");
    nmin = nr[0];
    for (irun = 1; irun < nrun; irun++)
       if (nr[irun] < nmin) nmin = nr[irun];
@@ -1786,29 +1800,47 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
          B += square(means[irun] - grand) * nmin / (nrun - 1);
       }
       rhat = (nmin > 1 && W > 0 ? sqrt(((nmin - 1.0) / nmin * W + B / nmin) / W) : 99);
+      rhats[j] = rhat;
       if (rhat > *max_rhat) *max_rhat = rhat;
-      if (ncombined > 1) {
+      if (rhat > target_rhat)
+         *rhat_pass = 0;
+      free(means);
+      free(vars);
+   }
+
+   if (!*rhat_pass) {
+      *min_ess = -1;
+      *ess_pass = 0;
+      pass = 0;
+      if (fparam) {
+         for (j = 0; j < ncheck; j++)
+            fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t\t%d\t%d\n",
+               chunk, samples_per_run, burnin_samples, varname[j], rhats[j], rhats[j] <= target_rhat, 0);
+      }
+   }
+   else {
+      y = (double*)malloc(ncombined * sizeof(double));
+      if (y == NULL) zerror("oom y in CheckConvergenceESS");
+      for (j = 0; j < ncheck; j++) {
+         if (ncombined > 1) {
          int k = 0;
          for (irun = 0; irun < nrun; irun++)
             for (i = 0; i < nr[irun]; i++)
                y[k++] = run_data[irun][j*nr[irun] + i];
          eff = Eff_IntegratedCorrelationTime(y, ncombined, &mean, &var, &rho1);
          ess = ncombined * eff;
+         }
+         else
+            ess = 0;
+         if (ess < *min_ess) *min_ess = ess;
+         if (ess < target_ess)
+            *ess_pass = 0;
+         if (fparam)
+            fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t%.8g\t%d\t%d\n",
+               chunk, samples_per_run, burnin_samples, varname[j], rhats[j], ess, rhats[j] <= target_rhat, ess >= target_ess);
+         if (ess < target_ess)
+            pass = 0;
       }
-      else
-         ess = 0;
-      if (ess < *min_ess) *min_ess = ess;
-      if (rhat > target_rhat)
-         *rhat_pass = 0;
-      if (ess < target_ess)
-         *ess_pass = 0;
-      if (fparam)
-         fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t%.8g\t%d\t%d\n",
-            chunk, samples_per_run, burnin_samples, varname[j], rhat, ess, rhat <= target_rhat, ess >= target_ess);
-      if (rhat > target_rhat || ess < target_ess)
-         pass = 0;
-      free(means);
-      free(vars);
    }
 
    for (irun = 0; irun < nrun; irun++)
@@ -1817,11 +1849,12 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    free(nr);
    free(check_col);
    free(cols);
+   free(rhats);
    for (j = 0; j < p; j++)
       free(varname[j]);
    free(varname);
    free(header_copy);
-   free(y);
+   if (y) free(y);
    return(pass);
 }
 
@@ -5783,12 +5816,13 @@ int MCMC(FILE* fout)
          for (j = 0; j < com.np; j++) fprintf(fmcmc, "\t%.7f", x[j]);
          if (mcmc.usedata) fprintf(fmcmc, "\t%.3f", lnL / BFbeta);
          fprintf(fmcmc, "\n");
-         fflush(fmcmc);
+         if (!AdaptiveChunkRun) fflush(fmcmc);
          WriteAdaptiveDiagSample(fdiag, x, lnL);
          samples_this_run++;
          if (AdaptiveChunkRun) {
             total_records = existing_samples + samples_this_run;
             if (adaptive_next_samples <= mcmc.maxSamples && total_records >= adaptive_next_records) {
+               if (fmcmc) fflush(fmcmc);
                if (fdiag) fflush(fdiag);
                if (com.checkpoint == 1)
                   SaveMCMCstate(com.checkpointf, ir + (autoresume ? checkpoint_gen : 0), data.lnpR, lnL, nround, mx, mlnL);
