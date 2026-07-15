@@ -1406,8 +1406,6 @@ void SetSeed(int seed, int PrintSeed)
 
    z_rndu = (unsigned int)seed;
    w_rndu = (unsigned int)seed;
-   x_rndu = 11;
-   y_rndu = 23;
 }
 
 void GetRNGstate(unsigned int state[4])
