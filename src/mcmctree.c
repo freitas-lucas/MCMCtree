@@ -20,6 +20,7 @@
 */
 
 #include "paml.h"
+#include <limits.h>
 
 #if(!defined _WIN32)
 #include <errno.h>
@@ -54,6 +55,8 @@ extern double PjumpOptimum;
 int GetOptions(char *ctlf);
 int SetupParallelRuns(char cwd[]);
 void MakeAbsolutePath(char path[], char cwd[]);
+void ResolveAARateFile(char cwd[], char argv0[]);
+int WriteUsedata2ControlFile(char oldctl[], char newctl[], char inBVf[]);
 int ReadTreeSeqs(FILE*fout);
 int ProcessNodeAnnotation(int* haslabel);
 int ReadBlengthGH(char infile[]);
@@ -263,6 +266,177 @@ void MakeAbsolutePath(char path[], char cwd[])
    path[2047] = '\0';
 }
 
+int TryAARatePath(char out[], const char dir[], const char file[])
+{
+   char candidate[4096];
+   FILE *f;
+
+   snprintf(candidate, sizeof(candidate), "%s/%s", dir, file);
+   f = fopen(candidate, "r");
+   if (f == NULL) return(0);
+   fclose(f);
+   strncpy(out, candidate, 2047);
+   out[2047] = '\0';
+   return(1);
+}
+
+int TryAARateNearExecutable(char out[], char argv0[], char cwd[], char file[])
+{
+   char exe[4096], dir[4096], *p, *path, *saveptr, *entry;
+
+   if (argv0 == NULL || argv0[0] == '\0') return(0);
+   if (strchr(argv0, '/') || strchr(argv0, '\\')) {
+      strncpy(exe, argv0, sizeof(exe) - 1);
+      exe[sizeof(exe) - 1] = '\0';
+      MakeAbsolutePath(exe, cwd);
+      strncpy(dir, exe, sizeof(dir) - 1);
+      dir[sizeof(dir) - 1] = '\0';
+      p = strrchr(dir, '/');
+      if (p) {
+         *p = '\0';
+         if (TryAARatePath(out, dir, file)) return(1);
+         snprintf(exe, sizeof(exe), "dat/%s", file);
+         if (TryAARatePath(out, dir, exe)) return(1);
+         p = strrchr(dir, '/');
+         if (p) {
+            *p = '\0';
+            snprintf(exe, sizeof(exe), "dat/%s", file);
+            if (TryAARatePath(out, dir, exe)) return(1);
+         }
+      }
+      return(0);
+   }
+
+   path = getenv("PATH");
+   if (path == NULL) return(0);
+   strncpy(exe, path, sizeof(exe) - 1);
+   exe[sizeof(exe) - 1] = '\0';
+   for (entry = strtok_r(exe, ":", &saveptr); entry; entry = strtok_r(NULL, ":", &saveptr)) {
+      char exefile[4096];
+      snprintf(exefile, sizeof(exefile), "%s/%s", entry, argv0);
+      if (!FileExists(exefile)) continue;
+      if (TryAARatePath(out, entry, file)) return(1);
+      snprintf(dir, sizeof(dir), "dat/%s", file);
+      if (TryAARatePath(out, entry, dir)) return(1);
+      strncpy(dir, entry, sizeof(dir) - 1);
+      dir[sizeof(dir) - 1] = '\0';
+      p = strrchr(dir, '/');
+      if (p) {
+         *p = '\0';
+         snprintf(exefile, sizeof(exefile), "dat/%s", file);
+         if (TryAARatePath(out, dir, exefile)) return(1);
+      }
+   }
+   return(0);
+}
+
+void ResolveAARateFile(char cwd[], char argv0[])
+{
+   char value[2048], lower[2048], file[128], dir[4096], *p, *env;
+   int i, known = 0;
+
+   if (com.daafile[0] == '\0') return;
+   if (com.seqtype != 2) {
+      printf("\nWarning: aaRate/aaRatefile is ignored unless seqtype = 2.\n");
+      return;
+   }
+   strncpy(value, com.daafile, sizeof(value) - 1);
+   value[sizeof(value) - 1] = '\0';
+   for (i = 0; value[i] && i < (int)sizeof(lower) - 1; i++)
+      lower[i] = (char)tolower((unsigned char)value[i]);
+   lower[i] = '\0';
+
+   if (strchr(value, '/') || strchr(value, '\\')) {
+      MakeAbsolutePath(com.daafile, cwd);
+      return;
+   }
+
+   if (!strcmp(lower, "lg") || !strcmp(lower, "lg.dat"))
+      { strcpy(file, "lg.dat"); known = 1; }
+   else if (!strcmp(lower, "wag") || !strcmp(lower, "wag.dat"))
+      { strcpy(file, "wag.dat"); known = 1; }
+   else if (!strcmp(lower, "jtt") || !strcmp(lower, "jones") || !strcmp(lower, "jones.dat"))
+      { strcpy(file, "jones.dat"); known = 1; }
+   else if (!strcmp(lower, "dayhoff") || !strcmp(lower, "dayhoff.dat"))
+      { strcpy(file, "dayhoff.dat"); known = 1; }
+   else if (!strcmp(lower, "dayhoff-dcmut") || !strcmp(lower, "dayhoff-dcmut.dat"))
+      { strcpy(file, "dayhoff-dcmut.dat"); known = 1; }
+   else if (!strcmp(lower, "jones-dcmut") || !strcmp(lower, "jones-dcmut.dat"))
+      { strcpy(file, "jones-dcmut.dat"); known = 1; }
+   else if (!strcmp(lower, "mtmam") || !strcmp(lower, "mtmam.dat"))
+      { strcpy(file, "mtmam.dat"); known = 1; }
+   else if (!strcmp(lower, "mtrev") || !strcmp(lower, "mtrev24") || !strcmp(lower, "mtrev24.dat"))
+      { strcpy(file, "mtREV24.dat"); known = 1; }
+   else if (!strcmp(lower, "mtzoa") || !strcmp(lower, "mtzoa.dat"))
+      { strcpy(file, "MtZoa.dat"); known = 1; }
+   else if (!strcmp(lower, "mtart") || !strcmp(lower, "mtart.dat"))
+      { strcpy(file, "mtArt.dat"); known = 1; }
+   else if (!strcmp(lower, "cprev") || !strcmp(lower, "cprev10") || !strcmp(lower, "cprev10.dat"))
+      { strcpy(file, "cpREV10.dat"); known = 1; }
+   else
+      strncpy(file, value, sizeof(file) - 1);
+   file[sizeof(file) - 1] = '\0';
+
+   env = getenv("PAML_DATA_DIR");
+   if (env && TryAARatePath(com.daafile, env, file)) return;
+   if (TryAARateNearExecutable(com.daafile, argv0, cwd, file)) return;
+   if (TryAARatePath(com.daafile, cwd, file)) return;
+   snprintf(dir, sizeof(dir), "dat/%s", file);
+   if (TryAARatePath(com.daafile, cwd, dir)) return;
+
+   strncpy(dir, cwd, sizeof(dir) - 1);
+   dir[sizeof(dir) - 1] = '\0';
+   for (;;) {
+      char relfile[256];
+      snprintf(relfile, sizeof(relfile), "dat/%s", file);
+      if (TryAARatePath(com.daafile, dir, relfile)) return;
+      p = strrchr(dir, '/');
+      if (p == NULL || p == dir) break;
+      *p = '\0';
+   }
+
+   if (known) {
+      printf("\naaRate = %s maps to %s, but the file was not found.\n", value, file);
+      zerror("set PAML_DATA_DIR or use aaRatefile with an explicit path");
+   }
+}
+
+int WriteUsedata2ControlFile(char oldctl[], char newctl[], char inBVf[])
+{
+   FILE *fin = zfopen(oldctl, "r"), *fout = zfopen(newctl, "w");
+   char line[4096], opt[128], *p;
+   int replaced = 0, i, active;
+
+   while (fgets(line, sizeof(line), fin)) {
+      active = 0;
+      for (i = 0; line[i]; i++) {
+         if (isalnum((unsigned char)line[i])) {
+            active = 1;
+            break;
+         }
+         if (line[i] == '*' || line[i] == '#')
+            break;
+      }
+      if (active && (p = strchr(line, '=')) != NULL) {
+         *p = '\0';
+         opt[0] = '\0';
+         sscanf(line, "%127s", opt);
+         *p = '=';
+         if (!strcmp(opt, "usedata")) {
+            fprintf(fout, "usedata = 2 %s %d\n", inBVf, data.transform);
+            replaced = 1;
+            continue;
+         }
+      }
+      fputs(line, fout);
+   }
+   if (!replaced)
+      fprintf(fout, "\nusedata = 2 %s %d\n", inBVf, data.transform);
+   fclose(fin);
+   fclose(fout);
+   return(0);
+}
+
 int WriteSeedUsedFile(int seed)
 {
    FILE *fseed = (FILE*)fopen("SeedUsed", "w");
@@ -274,6 +448,23 @@ int WriteSeedUsedFile(int seed)
 }
 
 #if(!defined _WIN32)
+int GeneratePositiveSeed(void)
+{
+   unsigned int raw = 0;
+   int seed = 0;
+   FILE *frand = fopen("/dev/urandom", "r");
+
+   if (frand) {
+      if (fread(&raw, sizeof(raw), 1, frand) != 1)
+         raw = 0;
+      fclose(frand);
+   }
+   if (raw == 0)
+      raw = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+   seed = (int)(raw % (unsigned int)(INT_MAX - 1)) + 1;
+   return(seed);
+}
+
 int ReadFullFD(int fd, void *buf, size_t n)
 {
    char *p = (char*)buf;
@@ -378,10 +569,9 @@ int SetupParallelRuns(char cwd[])
          resume_from_checkpoint = ((com.checkpoint == 2 || com.checkpoint == 3)
             && FileExists(com.checkpointf));
          if (!resume_from_checkpoint) {
-            seed = (mcmc.seed <= 0 ? -1 : mcmc.seed + irun);
-            SetSeed(seed, seed <= 0);
-            if (seed > 0)
-               WriteSeedUsedFile(seed);
+            seed = (mcmc.seed <= 0 ? GeneratePositiveSeed() : mcmc.seed + irun);
+            SetSeed(seed, 0);
+            WriteSeedUsedFile(seed);
          }
          else {
             printf("\n[run%d] Found %s; preserving SeedUsed and restoring RNG from checkpoint.\n",
@@ -496,10 +686,9 @@ int SetupAdaptiveParallelRuns(char cwd[])
          resume_from_checkpoint = ((original_checkpoint == 2 || original_checkpoint == 3)
             && FileExists(com.checkpointf));
          if (!resume_from_checkpoint) {
-            seed = (mcmc.seed <= 0 ? -1 : mcmc.seed + irun);
-            SetSeed(seed, seed <= 0);
-            if (seed > 0)
-               WriteSeedUsedFile(seed);
+            seed = (mcmc.seed <= 0 ? GeneratePositiveSeed() : mcmc.seed + irun);
+            SetSeed(seed, 0);
+            WriteSeedUsedFile(seed);
          }
          else {
             printf("\n[run%d] Found %s; preserving SeedUsed and restoring RNG from checkpoint.\n",
@@ -666,6 +855,43 @@ int main(int argc, char *argv[])
    if (getcwd(cwd, sizeof(cwd)) == NULL)
       zerror("getcwd failed");
    GetOptions(ctlf);
+   ResolveAARateFile(cwd, argv[0]);
+   if (mcmc.usedata == 4) {
+      char usedata2ctl[4096] = ".mcmctree.usedata2.ctl";
+
+      if (com.inBVf[0] == '\0')
+         strcpy(com.inBVf, "in.BV");
+      if (FileExists(com.inBVf)) {
+         printf("\nusedata = 4: found existing approximate likelihood file %s; skipping Hessian generation.\n", com.inBVf);
+      }
+      else {
+         fout = zfopen(com.outf, "w");
+         fprintf(fout, "MCMCTREE (%s) %s\n", pamlVerStr, com.seqf);
+         ReadTreeSeqs(fout);
+         if (com.seqtype == 2 && com.model == 2 && com.daafile[0] == '\0')
+            zerror("seqtype = 2, model = 2, usedata = 4 requires aaRate or aaRatefile");
+         printf("\nusedata = 4: generating approximate likelihood in %s and continuing with MCMC.\n", com.inBVf);
+         GenerateBlengthGH(com.inBVf);
+         fclose(fout);
+      }
+      MakeAbsolutePath(com.inBVf, cwd);
+      WriteUsedata2ControlFile(ctlf, usedata2ctl, com.inBVf);
+      printf("\nusedata = 4: restarting MCMCtree with usedata = 2 using %s.\n", com.inBVf);
+      fflush(NULL);
+#if(defined _WIN32)
+      {
+         char command[8192];
+         snprintf(command, sizeof(command), "%s %s", argv[0], usedata2ctl);
+         exit(system(command));
+      }
+#else
+      if (strchr(argv[0], '/'))
+         execl(argv[0], argv[0], usedata2ctl, (char*)NULL);
+      else
+         execlp(argv[0], argv[0], usedata2ctl, (char*)NULL);
+      zerror("failed to restart MCMCtree with usedata = 2");
+#endif
+   }
    if (mcmc.burninPer >= 0 && mcmc.usedata != 3) {
       if (!SetupAdaptiveParallelRuns(cwd))
          exit(0);
@@ -1886,19 +2112,21 @@ int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastg
       }
       if (!has_header && nline == 1)
          zerror("mcmcfile has no header; refusing to append");
+      if (sscanf(line, "%d", &igen) != 1)
+         zerror("cannot read generation number in mcmcfile");
+      if (maxgen > 0 && igen > maxgen) {
+         skipped++;
+         continue;
+      }
       if (nf != expected_fields) {
          printf("\nLine %d in %s has %d fields, while this run expects %d.\n",
             nline, filename, nf, expected_fields);
-         zerror("mcmcfile does not match the current analysis");
+         zerror("mcmcfile does not match the current analysis before checkpoint generation");
       }
-      if (sscanf(line, "%d", &igen) != 1)
-         zerror("cannot read generation number in mcmcfile");
-      if (maxgen <= 0 || igen <= maxgen) {
+      {
          n++;
          if (lastgen) *lastgen = igen;
       }
-      else
-         skipped++;
    }
    fclose(fin);
    free(line);
@@ -1941,17 +2169,19 @@ int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, in
       }
       if (!has_header && nline == 1)
          zerror("mcmcfile has no header; refusing to trim");
-      if (nf != expected_fields)
-         zerror("mcmcfile does not match the current analysis");
       if (sscanf(line, "%d", &igen) != 1)
          zerror("cannot read generation number in mcmcfile");
-      if (igen <= maxgen) {
+      if (igen > maxgen) {
+         skipped++;
+         continue;
+      }
+      if (nf != expected_fields)
+         zerror("mcmcfile does not match the current analysis before checkpoint generation");
+      {
          fputs(line, fout);
          n++;
          if (lastgen) *lastgen = igen;
       }
-      else
-         skipped++;
    }
    fclose(fin);
    fclose(fout);
@@ -2519,7 +2749,7 @@ int GenerateBlengthGH(char infile[])
    FILE *fseq, *ftree, *fctl;
    FILE *fBGH = zfopen(infile, "w");
    char tmpseqf[32], tmptreef[32], ctlf[32], outf[32], line[10000];
-   int i, locus;
+   int i, locus, status;
 
    mcmc.usedata = 1;
    for (locus = 0; locus < data.ngene; locus++) {
@@ -2553,16 +2783,17 @@ int GenerateBlengthGH(char infile[])
       if (com.seqtype) {
          fprintf(fctl, "seqtype = %d\n", com.seqtype);
       }
-      fprintf(fctl, "model = %d\n", com.model);
+      fprintf(fctl, "model = %d\n", (com.seqtype == 2 && com.model == -1 ? 2 : com.model));
       if (com.seqtype == 1) {
          fprintf(fctl, "icode = %d\n", com.icode);
          fprintf(fctl, "fix_kappa = 0\n kappa = 2\n");
       }
       if (com.seqtype == 2) {
-         fprintf(fctl, "aaRatefile = %s\n", com.daafile);
+         if (com.daafile[0])
+            fprintf(fctl, "aaRatefile = %s\n", com.daafile);
       }
       if (com.alpha)
-         fprintf(fctl, "fix_alpha = 0\nalpha = 0.5\nncatG = %d\n", com.ncatG);
+         fprintf(fctl, "fix_alpha = %d\nalpha = %.10g\nncatG = %d\n", com.fix_alpha, com.alpha, com.ncatG);
       fprintf(fctl, "Small_Diff = 0.1e-6\ngetSE = 2\n");
       fprintf(fctl, "method = %d\n", (com.alpha == 0 || com.ns > 100 ? 1 : 0));
 
@@ -2571,7 +2802,13 @@ int GenerateBlengthGH(char infile[])
       if (com.seqtype) sprintf(line, "codeml %s", ctlf);
       else            sprintf(line, "baseml %s", ctlf);
       printf("running %s\n", line);
-      system(line);
+      if (remove("rst2") && errno != ENOENT)
+         zerror("failed to remove old rst2 before generating approximate likelihood");
+      status = system(line);
+      if (!FileExists("rst2"))
+         zerror("baseml/codeml did not generate rst2");
+      if (status)
+         printf("\nWarning: %s returned a non-zero status, but rst2 was generated; continuing as in the original workflow.\n", line);
 
       appendfile(fBGH, "rst2");
    }
@@ -2583,14 +2820,14 @@ int GenerateBlengthGH(char infile[])
 int GetOptions(char *ctlf)
 {
    int  transform0 = ARCSIN_B; /* default transform: SQRT_B, LOG_B, ARCSIN_B */
-   int  iopt, i, j, nopt = 38, lline = 4096;
+   int  iopt, i, j, nopt = 39, lline = 4096;
    char line[4096], *pline, opt[33], *comment = "*#", ch;
    char *optstr[] = { "seed", "seqfile","treefile", "outfile", "mcmcfile", "checkpoint", "BayesFactorBeta",
         "seqtype", "aaRatefile", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
         "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
         "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs",
-        "burnin_per", "chunk_size", "target_rhat", "target_ess", "max_samples" };
+        "burnin_per", "chunk_size", "target_rhat", "target_ess", "max_samples", "aaRate" };
    double t = 1, *eps = mcmc.steplength;
    FILE  *fctl = zfopen(ctlf, "r");
 
@@ -2635,12 +2872,12 @@ int GetOptions(char *ctlf)
                case (5): sscanf(pline + 1, "%d%lf%s", &com.checkpoint, &com.checkpointp, com.checkpointf); break;
                case (6): sscanf(pline + 1, "%lf", &BFbeta);    break; /* beta for marginal likelihood */
                case (7): com.seqtype = (int)t;    break;
-               case (8): sscanf(pline + 2, "%s", com.daafile);  break;
+               case (8): sscanf(pline + 1, "%s", com.daafile);  break;
                case (9): com.icode = (int)t;      break;
                case (10): noisy = (int)t;          break;
                case (11):
                   j = sscanf(pline + 1, "%d %s%d", &mcmc.usedata, com.inBVf, &data.transform);
-                  if (mcmc.usedata == 2) {
+                  if (mcmc.usedata == 2 || mcmc.usedata == 4) {
                      if (strchr(com.inBVf, '*')) { 
                         strcpy(com.inBVf, "in.BV"); 
                         data.transform = transform0; 
@@ -2651,7 +2888,17 @@ int GetOptions(char *ctlf)
                   break;
                case (12): com.ndata = (int)t;           break;
                case (13): stree.duplication = (int)t;   break;
-               case (14): com.model = (int)t;           break;
+               case (14):
+                  {
+                     char modelstr[64], upper[64];
+                     int k;
+                     sscanf(pline + 1, "%63s", modelstr);
+                     for (k = 0; modelstr[k] && k < 63; k++)
+                        upper[k] = (char)toupper((unsigned char)modelstr[k]);
+                     upper[k] = '\0';
+                     com.model = (!strcmp(upper, "AA") ? -1 : (int)t);
+                  }
+                  break;
                case (15): com.clock = (int)t;           break;
                case (16):
                   sscanf(pline + 2, "%d%lf", &tipdate.flag, &tipdate.timeunit);
@@ -2719,6 +2966,7 @@ int GetOptions(char *ctlf)
                case (35): mcmc.targetRhat = t;       break;
                case (36): mcmc.targetESS = (int)t;   break;
                case (37): mcmc.maxSamples = (int)t;  break;
+               case (38): sscanf(pline + 1, "%s", com.daafile); break;
                }
                break;
             }
@@ -2750,6 +2998,8 @@ int GetOptions(char *ctlf)
       com.model = 0;  com.fix_kappa = com.fix_alpha = 1; com.alpha = 0;
       if (com.seqtype == 1) com.ncode = 61;
    }
+   if (com.model == -1 && com.seqtype != 2)
+      zerror("model = AA is only valid with seqtype = 2");
    if (com.seqtype == 1) {
       if (mcmc.usedata == 3) 
          zerror("you can run codeml outside mcmctree to implement codon models to work with mcmctree");
@@ -5579,7 +5829,7 @@ int MCMC(FILE* fout)
    int target_samples = 0, sample_now = 0, run_iterations = 0;
    int restored_checkpoint_stats = 0;
    int adaptive_next_samples = 0, adaptive_next_records = 0, adaptive_stop = 0, total_records = 0;
-   int adaptive_diag_ncols = 0;
+   int adaptive_diag_ncols = 0, summary_samples = 0;
    double lnL = 0, mlnL = 0, nround = 0, *x, *mx, postEFossil[MaxNFossils] = { 0 };
    double au = data.rgenepara[0], bu = data.rgenepara[1], a = data.rgenepara[2];
    char timestr[36];
@@ -5646,11 +5896,12 @@ int MCMC(FILE* fout)
             }
 #endif
          }
-         if (mcmc.print && !AdaptiveChunkRun) {
+         if (mcmc.print) {
             if (mcmc.burninPer >= 0) {
-               int burnin_samples = (int)(mcmc.nsample * mcmc.burninPer + 0.5);
+               int burnin_base = (AdaptiveChunkRun ? existing_samples : mcmc.nsample);
+               int burnin_samples = (int)(burnin_base * mcmc.burninPer + 0.5);
                if (burnin_samples < 0) burnin_samples = 0;
-               if (burnin_samples >= mcmc.nsample) burnin_samples = mcmc.nsample - 1;
+               if (burnin_samples >= burnin_base) burnin_samples = burnin_base - 1;
                CreatePostBurninMCMCFile(com.mcmcf, "mcmc.postburnin.tmp", burnin_samples);
                DescriptiveStatisticsSimpleMCMCTREE(fout, "mcmc.postburnin.tmp");
                remove("mcmc.postburnin.tmp");
@@ -5875,21 +6126,16 @@ int MCMC(FILE* fout)
    printf("\nTime used: %s", printtime(timestr));
    fprintf(fout, "\nTime used: %s", printtime(timestr));
 
-   if (AdaptiveChunkRun) {
-      free(x);
-      FreeMem();
-      printf("\ntime prior: %s\n", (data.priortime ? "beta" : "Birth-Death-Sampling"));
-      printf("rate prior: %s\n", (data.priorrate ? "gamma" : "Log-Normal"));
-      if (mcmc.usedata == 2 && data.transform)
-         printf("%s transform is used in approx like calculation.\n", Btransform[data.transform]);
-      printf("\nTime used: %s\n", printtime(timestr));
-      return(0);
-   }
-
    if (mcmc.burninPer >= 0) {
-      int burnin_samples = (int)(mcmc.nsample * mcmc.burninPer + 0.5);
+      int burnin_base = mcmc.nsample;
+      if (AdaptiveChunkRun) {
+         summary_samples = CountMCMCSamples(com.mcmcf, expected_fields, 0, NULL, NULL);
+         if (summary_samples > 0)
+            burnin_base = summary_samples;
+      }
+      int burnin_samples = (int)(burnin_base * mcmc.burninPer + 0.5);
       if (burnin_samples < 0) burnin_samples = 0;
-      if (burnin_samples >= mcmc.nsample) burnin_samples = mcmc.nsample - 1;
+      if (burnin_samples >= burnin_base) burnin_samples = burnin_base - 1;
       CreatePostBurninMCMCFile(com.mcmcf, "mcmc.postburnin.tmp", burnin_samples);
       MeanMCMCFile("mcmc.postburnin.tmp", com.np, mx);
    }
