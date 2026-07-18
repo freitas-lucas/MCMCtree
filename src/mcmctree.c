@@ -61,6 +61,8 @@ int ReadTreeSeqs(FILE*fout);
 int ProcessNodeAnnotation(int* haslabel);
 int ReadBlengthGH(char infile[]);
 int GenerateBlengthGH(char infile[]);
+int GenerateBlengthGHLocusFiles(int locus, char workdir[]);
+int RunBlengthGHJobs(char workdirs[][64], int njob);
 int GetMem(void);
 void FreeMem(void);
 int UseLocus(int locus, int copycondP, int setmodel, int setSeqName);
@@ -337,7 +339,7 @@ void ResolveAARateFile(char cwd[], char argv0[])
 
    if (com.daafile[0] == '\0') return;
    if (com.seqtype != 2) {
-      printf("\nWarning: aaRate/aaRatefile is ignored unless seqtype = 2.\n");
+      printf("\nWarning: aaRatefile is ignored unless seqtype = 2.\n");
       return;
    }
    strncpy(value, com.daafile, sizeof(value) - 1);
@@ -396,7 +398,7 @@ void ResolveAARateFile(char cwd[], char argv0[])
    }
 
    if (known) {
-      printf("\naaRate = %s maps to %s, but the file was not found.\n", value, file);
+      printf("\naaRatefile = %s maps to %s, but the file was not found.\n", value, file);
       zerror("set PAML_DATA_DIR or use aaRatefile with an explicit path");
    }
 }
@@ -869,7 +871,7 @@ int main(int argc, char *argv[])
          fprintf(fout, "MCMCTREE (%s) %s\n", pamlVerStr, com.seqf);
          ReadTreeSeqs(fout);
          if (com.seqtype == 2 && com.model == 2 && com.daafile[0] == '\0')
-            zerror("seqtype = 2, model = 2, usedata = 4 requires aaRate or aaRatefile");
+            zerror("seqtype = 2, model = 2, usedata = 4 requires aaRatefile");
          printf("\nusedata = 4: generating approximate likelihood in %s and continuing with MCMC.\n", com.inBVf);
          GenerateBlengthGH(com.inBVf);
          fclose(fout);
@@ -2740,78 +2742,198 @@ int ReadBlengthGH(char infile[])
 }
 
 
+int GenerateBlengthGHLocusFiles(int locus, char workdir[])
+{
+   FILE *fseq, *ftree, *fctl;
+   char tmpseqf[32], tmptreef[32], ctlf[32], outf[32], line[10000];
+   int i;
+
+   sprintf(workdir, "tmp%04d_bv", locus + 1);
+   if (mkdir(workdir, 0777) && errno != EEXIST)
+      zerror("failed to create temporary directory for approximate likelihood");
+
+   sprintf(tmpseqf, "%s/tmp%04d.txt", workdir, locus + 1);
+   sprintf(tmptreef, "%s/tmp%04d.trees", workdir, locus + 1);
+   sprintf(ctlf, "%s/tmp%04d.ctl", workdir, locus + 1);
+   sprintf(outf, "tmp%04d.out", locus + 1);
+   fseq = zfopen(tmpseqf, "w");
+   ftree = zfopen(tmptreef, "w");
+   fctl = zfopen(ctlf, "w");
+
+   UseLocus(locus, 0, 0, 1);
+   com.cleandata = data.cleandata[locus];
+   for (i = 0; i < com.ns; i++)
+      com.z[i] = data.z[locus][i];
+   com.npatt = com.posG[1] = data.npatt[locus];
+   com.posG[0] = 0;
+   com.fpatt = data.fpatt[locus];
+
+   DeRoot();
+
+   printPatterns(fseq);
+   fprintf(ftree, "  1\n\n");
+   OutTreeN(ftree, 1, 0);
+   fprintf(ftree, "\n\n");
+
+   fprintf(fctl, "seqfile = tmp%04d.txt\n", locus + 1);
+   fprintf(fctl, "treefile = tmp%04d.trees\n", locus + 1);
+   fprintf(fctl, "outfile = %s\nnoisy = 3\n", outf);
+   if (com.seqtype) {
+      fprintf(fctl, "seqtype = %d\n", com.seqtype);
+   }
+   fprintf(fctl, "model = %d\n", (com.seqtype == 2 && com.model == -1 ? 2 : com.model));
+   if (com.seqtype == 1) {
+      fprintf(fctl, "icode = %d\n", com.icode);
+      fprintf(fctl, "fix_kappa = 0\n kappa = 2\n");
+   }
+   if (com.seqtype == 2) {
+      if (com.daafile[0])
+         fprintf(fctl, "aaRatefile = %s\n", com.daafile);
+   }
+   if (com.alpha)
+      fprintf(fctl, "fix_alpha = %d\nalpha = %.10g\nncatG = %d\n", com.fix_alpha, com.alpha, com.ncatG);
+   fprintf(fctl, "Small_Diff = 0.1e-6\ngetSE = 2\n");
+   fprintf(fctl, "method = %d\n", (com.alpha == 0 || com.ns > 100 ? 1 : 0));
+
+   fclose(fseq);  fclose(ftree);  fclose(fctl);
+   sprintf(line, "%s/rst2", workdir);
+   if (remove(line) && errno != ENOENT)
+      zerror("failed to remove old rst2 before generating approximate likelihood");
+
+   return(0);
+}
+
+
+int RunBlengthGHJobs(char workdirs[][64], int njob)
+{
+   char command[128], ctlf[32], rst2f[128];
+   int i, irun, running = 0, finished = 0, status, maxParallel = njob;
+
+#if(defined _WIN32)
+   maxParallel = 1;
+#else
+   long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+   char *cpusenv = getenv("SLURM_CPUS_PER_TASK");
+   pid_t *pids;
+   int *jobids;
+
+   if (cpusenv && atoi(cpusenv) > 0)
+      ncpu = atoi(cpusenv);
+   if (ncpu > 0 && ncpu < maxParallel) maxParallel = (int)ncpu;
+   if ((pids = (pid_t*)malloc(njob * sizeof(pid_t))) == NULL ||
+       (jobids = (int*)malloc(njob * sizeof(int))) == NULL)
+      zerror("oom RunBlengthGHJobs");
+   for (i = 0; i < njob; i++) {
+      pids[i] = -1;
+      jobids[i] = -1;
+   }
+#endif
+
+   if (maxParallel < 1) maxParallel = 1;
+   if (njob > 1)
+      printf("\nRunning %d approximate-likelihood jobs, up to %d in parallel.\n", njob, maxParallel);
+
+   for (i = 0; i < njob || running > 0; ) {
+      while (i < njob && running < maxParallel) {
+         sprintf(ctlf, "tmp%04d.ctl", i + 1);
+         if (com.seqtype) sprintf(command, "codeml %s", ctlf);
+         else            sprintf(command, "baseml %s", ctlf);
+         printf("running %s in %s\n", command, workdirs[i]);
+         fflush(NULL);
+#if(defined _WIN32)
+         {
+            char oldcwd[4096];
+            if (getcwd(oldcwd, sizeof(oldcwd)) == NULL)
+               zerror("getcwd failed");
+            if (chdir(workdirs[i]))
+               zerror("failed to enter temporary directory for approximate likelihood");
+            status = system(command);
+            if (chdir(oldcwd))
+               zerror("failed to restore working directory");
+            sprintf(rst2f, "%s/rst2", workdirs[i]);
+            if (!FileExists(rst2f))
+               zerror("baseml/codeml did not generate rst2");
+            if (status)
+               printf("\nWarning: %s returned a non-zero status, but rst2 was generated; continuing as in the original workflow.\n", command);
+            i++;
+         }
+#else
+         {
+            pid_t pid = fork();
+            if (pid < 0)
+               zerror("fork failed while generating approximate likelihood");
+            if (pid == 0) {
+               if (chdir(workdirs[i]))
+                  _exit(127);
+               _exit(system(command) == 0 ? 0 : 1);
+            }
+            pids[i] = pid;
+            jobids[i] = i;
+            i++;
+            running++;
+         }
+#endif
+      }
+#if(!defined _WIN32)
+      {
+         pid_t done = wait(&status);
+         int job = -1;
+         if (done < 0) {
+            if (errno == EINTR) continue;
+            zerror("wait failed while generating approximate likelihood");
+         }
+         for (irun = 0; irun < njob; irun++)
+            if (pids[irun] == done) {
+               job = jobids[irun];
+               pids[irun] = -1;
+               break;
+            }
+         running--;
+         finished++;
+         if (job < 0)
+            zerror("unknown approximate-likelihood worker finished");
+         sprintf(rst2f, "%s/rst2", workdirs[job]);
+         if (!FileExists(rst2f))
+            zerror("baseml/codeml did not generate rst2");
+         if (!WIFEXITED(status) || WEXITSTATUS(status))
+            printf("\nWarning: approximate-likelihood job %d returned a non-zero status, but rst2 was generated; continuing as in the original workflow.\n", job + 1);
+      }
+#endif
+   }
+
+#if(!defined _WIN32)
+   free(pids);
+   free(jobids);
+#endif
+   return(finished);
+}
+
+
 int GenerateBlengthGH(char infile[])
 {
    /* This generates the sequence alignment and tree files for calculating branch
       lengths, gradient, and hessian.
       This mimics Jeff Thorne's estbranches program.
    */
-   FILE *fseq, *ftree, *fctl;
    FILE *fBGH = zfopen(infile, "w");
-   char tmpseqf[32], tmptreef[32], ctlf[32], outf[32], line[10000];
-   int i, locus, status;
+   char (*workdirs)[64];
+   char rst2f[128];
+   int locus;
 
    mcmc.usedata = 1;
+   if ((workdirs = (char(*)[64])malloc(data.ngene * sizeof(*workdirs))) == NULL)
+      zerror("oom GenerateBlengthGH");
+
    for (locus = 0; locus < data.ngene; locus++) {
       printf("\n\n*** Locus %d ***\n", locus + 1);
-      sprintf(tmpseqf, "tmp%04d.txt", locus + 1);
-      sprintf(tmptreef, "tmp%04d.trees", locus + 1);
-      sprintf(ctlf, "tmp%04d.ctl", locus + 1);
-      sprintf(outf, "tmp%04d.out", locus + 1);
-      fseq = zfopen(tmpseqf, "w");
-      ftree = zfopen(tmptreef, "w");
-      fctl = zfopen(ctlf, "w");
-
-      UseLocus(locus, 0, 0, 1);
-      com.cleandata = data.cleandata[locus];
-      for (i = 0; i < com.ns; i++)
-         com.z[i] = data.z[locus][i];
-      com.npatt = com.posG[1] = data.npatt[locus];
-      com.posG[0] = 0;
-      com.fpatt = data.fpatt[locus];
-
-      DeRoot();
-
-      printPatterns(fseq);
-      fprintf(ftree, "  1\n\n");
-      OutTreeN(ftree, 1, 0);
-      fprintf(ftree, "\n\n");
-
-      fprintf(fctl, "seqfile = %s\n", tmpseqf);
-      fprintf(fctl, "treefile = %s\n", tmptreef);
-      fprintf(fctl, "outfile = %s\nnoisy = 3\n", outf);
-      if (com.seqtype) {
-         fprintf(fctl, "seqtype = %d\n", com.seqtype);
-      }
-      fprintf(fctl, "model = %d\n", (com.seqtype == 2 && com.model == -1 ? 2 : com.model));
-      if (com.seqtype == 1) {
-         fprintf(fctl, "icode = %d\n", com.icode);
-         fprintf(fctl, "fix_kappa = 0\n kappa = 2\n");
-      }
-      if (com.seqtype == 2) {
-         if (com.daafile[0])
-            fprintf(fctl, "aaRatefile = %s\n", com.daafile);
-      }
-      if (com.alpha)
-         fprintf(fctl, "fix_alpha = %d\nalpha = %.10g\nncatG = %d\n", com.fix_alpha, com.alpha, com.ncatG);
-      fprintf(fctl, "Small_Diff = 0.1e-6\ngetSE = 2\n");
-      fprintf(fctl, "method = %d\n", (com.alpha == 0 || com.ns > 100 ? 1 : 0));
-
-      fclose(fseq);  fclose(ftree);  fclose(fctl);
-
-      if (com.seqtype) sprintf(line, "codeml %s", ctlf);
-      else            sprintf(line, "baseml %s", ctlf);
-      printf("running %s\n", line);
-      if (remove("rst2") && errno != ENOENT)
-         zerror("failed to remove old rst2 before generating approximate likelihood");
-      status = system(line);
-      if (!FileExists("rst2"))
-         zerror("baseml/codeml did not generate rst2");
-      if (status)
-         printf("\nWarning: %s returned a non-zero status, but rst2 was generated; continuing as in the original workflow.\n", line);
-
-      appendfile(fBGH, "rst2");
+      GenerateBlengthGHLocusFiles(locus, workdirs[locus]);
    }
+   RunBlengthGHJobs(workdirs, data.ngene);
+   for (locus = 0; locus < data.ngene; locus++) {
+      sprintf(rst2f, "%s/rst2", workdirs[locus]);
+      appendfile(fBGH, rst2f);
+   }
+   free(workdirs);
    fclose(fBGH);
    return(0);
 }
@@ -2827,7 +2949,7 @@ int GetOptions(char *ctlf)
         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
         "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
         "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs",
-        "burnin_per", "chunk_size", "target_rhat", "target_ess", "max_samples", "aaRate" };
+        "burnin_per", "chunk_size", "target_rhat", "target_ess", "max_samples", "aaRateFile" };
    double t = 1, *eps = mcmc.steplength;
    FILE  *fctl = zfopen(ctlf, "r");
 
