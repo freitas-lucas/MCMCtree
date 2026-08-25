@@ -97,7 +97,7 @@ int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastg
 int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, int *lastgen);
 int SetupAdaptiveParallelRuns(char cwd[]);
 int CombineRunsPostBurnin(char outfile[], int nrun, int burnin_samples);
-int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
+int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
    FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin);
 int CreatePostBurninMCMCFile(char infile[], char outfile[], int burnin_samples);
 int MeanMCMCFile(char infile[], int np, double mx[]);
@@ -729,7 +729,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
          break;
 
       fparam = zfopen("adaptive_stats_by_parameter.txt", "a");
-      current_pass = CheckConvergenceESS(combinedf, mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
+      current_pass = CheckConvergenceESS(mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
          fparam, round, target_samples, &rhat_pass, &ess_pass, &postburnin_per_run, &combined_postburnin);
       fclose(fparam);
       final_samples = target_samples;
@@ -1923,15 +1923,17 @@ int MeanMCMCFile(char infile[], int np, double mx[])
    return(0);
 }
 
-int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
+int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
    FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin)
 {
    char filename[256], header[100000];
-   char *header_copy, *token, **varname;
+   char *header_copy, *token, **check_name;
    double **run_data, *y = NULL, *rhats, mean, var, rho1, W, B, grand, rhat, eff, ess;
-   int *nr, *check_col, *cols, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
+   int *nr, *cols, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
    FILE *fin;
 
+   if (nrun < 2)
+      zerror("CheckConvergenceESS requires at least two independent runs");
    run_data = (double**)malloc(nrun * sizeof(double*));
    nr = (int*)malloc(nrun * sizeof(int));
    if (run_data == NULL || nr == NULL) zerror("oom in CheckConvergenceESS");
@@ -1943,24 +1945,20 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    fclose(fin);
    p = CountFields(header);
 
-   check_col = (int*)malloc(p * sizeof(int));
-   varname = (char**)malloc(p * sizeof(char*));
+   check_name = (char**)malloc(p * sizeof(char*));
    cols = (int*)malloc(p * sizeof(int));
    header_copy = (char*)malloc((strlen(header) + 1) * sizeof(char));
-   if (check_col == NULL || varname == NULL || cols == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
-   memset(check_col, 0, p * sizeof(int));
+   if (check_name == NULL || cols == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
    for (j = 0; j < p; j++) {
-      varname[j] = (char*)malloc(64 * sizeof(char));
-      if (varname[j] == NULL) zerror("oom varname in CheckConvergenceESS");
-      varname[j][0] = '\0';
+      check_name[j] = (char*)malloc(64 * sizeof(char));
+      if (check_name[j] == NULL) zerror("oom check_name in CheckConvergenceESS");
+      check_name[j][0] = '\0';
    }
    strcpy(header_copy, header);
    for (j = 0, token = strtok(header_copy, " \t\r\n"); token && j < p; j++, token = strtok(NULL, " \t\r\n")) {
-      strncpy(varname[j], token, 63);
-      varname[j][63] = '\0';
       if (strncmp(token, "t_n", 3) == 0 || strcmp(token, "lnL") == 0) {
-         check_col[ncheck] = j;
-         strcpy(varname[ncheck], varname[j]);
+         strncpy(check_name[ncheck], token, 63);
+         check_name[ncheck][63] = '\0';
          cols[ncheck] = j;
          ncheck++;
       }
@@ -1984,7 +1982,6 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
          ReadMCMCColumnsPostBurnin(filename, burnin_samples, samples_per_run + (mcmc.sampfreq > 1), p, ncheck, cols, &nr[irun], &run_data[irun]);
       }
       if (nr[irun] < 2) pass = 0;
-      ncombined += nr[irun];
    }
 
    *max_rhat = 0;
@@ -1996,6 +1993,7 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
    nmin = nr[0];
    for (irun = 1; irun < nrun; irun++)
       if (nr[irun] < nmin) nmin = nr[irun];
+   ncombined = nmin * nrun;
    *postburnin_per_run = nmin;
    *combined_postburnin = ncombined;
    if (nmin < 2 || ncombined < 2) {
@@ -2043,29 +2041,28 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       if (fparam) {
          for (j = 0; j < ncheck; j++)
             fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t\t%d\t%d\n",
-               chunk, samples_per_run, burnin_samples, varname[j], rhats[j], rhats[j] <= target_rhat, 0);
+               chunk, samples_per_run, burnin_samples, check_name[j], rhats[j], rhats[j] <= target_rhat, 0);
       }
    }
    else {
-      y = (double*)malloc(ncombined * sizeof(double));
+      y = (double*)malloc(nmin * sizeof(double));
       if (y == NULL) zerror("oom y in CheckConvergenceESS");
       for (j = 0; j < ncheck; j++) {
-         if (ncombined > 1) {
-         int k = 0;
-         for (irun = 0; irun < nrun; irun++)
-            for (i = 0; i < nr[irun]; i++)
-               y[k++] = run_data[irun][j*nr[irun] + i];
-         eff = Eff_IntegratedCorrelationTime(y, ncombined, &mean, &var, &rho1);
-         ess = ncombined * eff;
+         ess = 0;
+         if (nmin > 1) {
+            for (irun = 0; irun < nrun; irun++) {
+               for (i = 0; i < nmin; i++)
+                  y[i] = run_data[irun][j*nr[irun] + i];
+               eff = Eff_IntegratedCorrelationTime(y, nmin, &mean, &var, &rho1);
+               ess += nmin * eff;
+            }
          }
-         else
-            ess = 0;
          if (ess < *min_ess) *min_ess = ess;
          if (ess < target_ess)
             *ess_pass = 0;
          if (fparam)
             fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t%.8g\t%d\t%d\n",
-               chunk, samples_per_run, burnin_samples, varname[j], rhats[j], ess, rhats[j] <= target_rhat, ess >= target_ess);
+               chunk, samples_per_run, burnin_samples, check_name[j], rhats[j], ess, rhats[j] <= target_rhat, ess >= target_ess);
          if (ess < target_ess)
             pass = 0;
       }
@@ -2075,12 +2072,11 @@ int CheckConvergenceESS(char combinedf[], int nrun, int burnin_samples, double t
       free(run_data[irun]);
    free(run_data);
    free(nr);
-   free(check_col);
    free(cols);
    free(rhats);
    for (j = 0; j < p; j++)
-      free(varname[j]);
-   free(varname);
+      free(check_name[j]);
+   free(check_name);
    free(header_copy);
    if (y) free(y);
    return(pass);
