@@ -211,10 +211,10 @@ struct DATA { /* locus-specific data and tree information */
 
 struct MCMCPARAMETERS {
    int burnin, nsample, sampfreq, usedata, saveconP, print, nrun, seed;
-   int chunkSize, targetESS, maxSamples;
+   int mode, chunkSize, targetESS;
    int nsteplength, steplengthOffset[8];
    char  *accept;
-   double burninPer, targetRhat;
+   double burninFrac, targetRhat;
    double *steplength, *Pjump;
 }  mcmc; /* control parameters */
 
@@ -222,6 +222,7 @@ struct MCMCPARAMETERS {
 char *models[] = { "JC69", "K80", "F81", "F84", "HKY85", "T92", "TN93", "REV" };
 enum MODELS { JC69, K80, F81, F84, HKY85, T92, TN93, REV };
 enum DATATYPE { BASE, AA, CODON, MORPHC };
+enum MCMC_MODES { MCMC_CLASSIC, MCMC_DYNAMIC };
 
 int nR = 4;
 double PMat[16], Cijk[64], Root[4];
@@ -619,8 +620,8 @@ int SetupAdaptiveParallelRuns(char cwd[])
 
    if (mcmc.nrun < 2)
       zerror("adaptive MCMC needs n_runs > 1");
-   if (mcmc.chunkSize < 1 || mcmc.maxSamples < 1)
-      zerror("chunk_size and max_samples should be > 0");
+   if (mcmc.chunkSize < 1 || mcmc.nsample < 1)
+      zerror("chunk_size and nsample should be > 0 in dynamic mode");
    if (mcmc.targetESS <= 0)
       zerror("target_ess should be > 0");
    if (mcmc.targetRhat <= 1)
@@ -633,9 +634,9 @@ int SetupAdaptiveParallelRuns(char cwd[])
    if (com.seqtype == 2)
       MakeAbsolutePath(com.daafile, cwd);
 
-   printf("\nAdaptive MCMC with %d independent runs.\n", mcmc.nrun);
-   printf("chunk_size = %d, burnin_per = %.4f, target_rhat = %.4f, target_ess = %d, max_samples = %d\n",
-      mcmc.chunkSize, mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples);
+   printf("\nDynamic MCMC with %d independent runs.\n", mcmc.nrun);
+   printf("chunk_size = %d, burnin = %.4f, target_rhat = %.4f, target_ess = %d, max nsample = %d\n",
+      mcmc.chunkSize, mcmc.burninFrac, mcmc.targetRhat, mcmc.targetESS, mcmc.nsample);
    printf("Persistent adaptive workers: each run reads input files once and pauses at chunk boundaries.\n");
 
    fstats = zfopen("adaptive_stats.txt", "w");
@@ -680,7 +681,6 @@ int SetupAdaptiveParallelRuns(char cwd[])
          AdaptiveCommandFD = to_child[irun][0];
          AdaptiveChunkRun = 1;
          mcmc.burnin = 0;
-         mcmc.nsample = mcmc.maxSamples;
          com.checkpoint = 3;
 
          if (chdir(rundir))
@@ -707,8 +707,8 @@ int SetupAdaptiveParallelRuns(char cwd[])
       close(to_child[irun][0]);
    }
 
-   for (target_samples = mcmc.chunkSize; target_samples <= mcmc.maxSamples; target_samples += mcmc.chunkSize) {
-      int burnin_samples = (int)(target_samples * mcmc.burninPer + 0.5);
+   for (target_samples = mcmc.chunkSize; target_samples <= mcmc.nsample; target_samples += mcmc.chunkSize) {
+      int burnin_samples = (int)(target_samples * mcmc.burninFrac + 0.5);
 
       round++;
       if (burnin_samples < 0) burnin_samples = 0;
@@ -757,7 +757,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
       if (done) {
          printf("Stopping: convergence and ESS targets reached in 3 consecutive checks.\n");
       }
-      command = (done || target_samples + mcmc.chunkSize > mcmc.maxSamples ? 'S' : 'C');
+      command = (done || target_samples + mcmc.chunkSize > mcmc.nsample ? 'S' : 'C');
       for (irun = 0; irun < mcmc.nrun; irun++)
          if (WriteFullFD(to_child[irun][1], &command, sizeof(char)) != 1)
             failed = 1;
@@ -784,10 +784,10 @@ int SetupAdaptiveParallelRuns(char cwd[])
 
    if (!done) {
       if (min_ess < 0)
-         printf("\nWarning: max_samples reached before convergence/ESS targets. max Rhat = %.5f, ESS skipped because Rhat failed\n",
+         printf("\nWarning: nsample reached before convergence/ESS targets. max Rhat = %.5f, ESS skipped because Rhat failed\n",
             max_rhat);
       else
-         printf("\nWarning: max_samples reached before convergence/ESS targets. max Rhat = %.5f, min ESS = %.1f\n",
+         printf("\nWarning: nsample reached before convergence/ESS targets. max Rhat = %.5f, min ESS = %.1f\n",
             max_rhat, min_ess);
    }
 
@@ -800,8 +800,8 @@ int SetupAdaptiveParallelRuns(char cwd[])
    fprintf(fout, "MCMCTREE combined summary (%s) %s\n", pamlVerStr, com.seqf);
    ReadTreeSeqs(fout);
    fprintf(fout, "\nAdaptive MCMC summary across %d independent runs\n", mcmc.nrun);
-   fprintf(fout, "burnin_per = %.4f  target_rhat = %.4f  target_ess = %d  max_samples = %d  final_samples = %d\n",
-      mcmc.burninPer, mcmc.targetRhat, mcmc.targetESS, mcmc.maxSamples, final_samples);
+   fprintf(fout, "mode = dynamic  burnin = %.4f  target_rhat = %.4f  target_ess = %d  nsample = %d  final_samples = %d\n",
+      mcmc.burninFrac, mcmc.targetRhat, mcmc.targetESS, mcmc.nsample, final_samples);
    fprintf(fout, "Final diagnostics: max Rhat = %.5f  min ESS = %.1f\n", max_rhat, min_ess);
    DescriptiveStatisticsSimpleMCMCTREE(fout, combinedf);
    fclose(fout);
@@ -894,7 +894,7 @@ int main(int argc, char *argv[])
       zerror("failed to restart MCMCtree with usedata = 2");
 #endif
    }
-   if (mcmc.burninPer >= 0 && mcmc.usedata != 3) {
+   if (mcmc.mode == MCMC_DYNAMIC && mcmc.usedata != 3) {
       if (!SetupAdaptiveParallelRuns(cwd))
          exit(0);
    }
@@ -2938,14 +2938,14 @@ int GenerateBlengthGH(char infile[])
 int GetOptions(char *ctlf)
 {
    int  transform0 = ARCSIN_B; /* default transform: SQRT_B, LOG_B, ARCSIN_B */
-   int  iopt, i, j, nopt = 39, lline = 4096;
+   int  iopt, i, j, nopt = 38, lline = 4096;
    char line[4096], *pline, opt[33], *comment = "*#", ch;
    char *optstr[] = { "seed", "seqfile","treefile", "outfile", "mcmcfile", "checkpoint", "BayesFactorBeta",
         "seqtype", "aaRatefile", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
         "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
         "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs",
-        "burnin_per", "chunk_size", "target_rhat", "target_ess", "max_samples", "aaRateFile" };
+        "chunk_size", "target_rhat", "target_ess", "aaRateFile", "mode" };
    double t = 1, *eps = mcmc.steplength;
    FILE  *fctl = zfopen(ctlf, "r");
 
@@ -2953,11 +2953,11 @@ int GetOptions(char *ctlf)
    data.transform = transform0;
    mcmc.nrun = 1;
    mcmc.seed = 0;
-   mcmc.burninPer = -1;
+   mcmc.mode = MCMC_CLASSIC;
+   mcmc.burninFrac = 0;
    mcmc.chunkSize = 1000;
    mcmc.targetRhat = 1.01;
    mcmc.targetESS = 200;
-   mcmc.maxSamples = 20000;
    com.checkpointp = 0.1;
    strcpy(com.checkpointf, "mcmctree.ckpt");
    if (fctl) {
@@ -3070,7 +3070,7 @@ int GetOptions(char *ctlf)
                   if (data.sigma2para[2] <= 0) data.sigma2para[2] = 1;
                   break;
                case (27): mcmc.print = (int)t;     break;
-               case (28): mcmc.burnin = (int)t;    break;
+               case (28): mcmc.burnin = (int)t; mcmc.burninFrac = t; break;
                case (29): mcmc.sampfreq = (int)t;  break;
                case (30): mcmc.nsample = (int)t;   break;
                case (31):
@@ -3079,12 +3079,26 @@ int GetOptions(char *ctlf)
                   sscanf(pline + 1, "%d:%lf%lf%lf%lf%lf%lf", &j, eps, eps + 1, eps + 2, eps + 3, eps + 4, eps + 5);
                   break;
                case (32): mcmc.nrun = (int)t;        break;
-               case (33): mcmc.burninPer = t;        break;
-               case (34): mcmc.chunkSize = (int)t;   break;
-               case (35): mcmc.targetRhat = t;       break;
-               case (36): mcmc.targetESS = (int)t;   break;
-               case (37): mcmc.maxSamples = (int)t;  break;
-               case (38): sscanf(pline + 1, "%s", com.daafile); break;
+               case (33): mcmc.chunkSize = (int)t;   break;
+               case (34): mcmc.targetRhat = t;       break;
+               case (35): mcmc.targetESS = (int)t;   break;
+               case (36): sscanf(pline + 1, "%s", com.daafile); break;
+               case (37):
+                  {
+                     char modestr[64], upper[64];
+                     int k;
+                     sscanf(pline + 1, "%63s", modestr);
+                     for (k = 0; modestr[k] && k < 63; k++)
+                        upper[k] = (char)toupper((unsigned char)modestr[k]);
+                     upper[k] = '\0';
+                     if (!strcmp(upper, "CLASSIC"))
+                        mcmc.mode = MCMC_CLASSIC;
+                     else if (!strcmp(upper, "DYNAMIC"))
+                        mcmc.mode = MCMC_DYNAMIC;
+                     else
+                        zerror("mode should be classic or dynamic");
+                  }
+                  break;
                }
                break;
             }
@@ -3104,11 +3118,17 @@ int GetOptions(char *ctlf)
       com.ndata = 1;
    if (mcmc.nrun < 1)
       zerror("n_runs should be >= 1");
-   if (mcmc.burninPer < -1 || mcmc.burninPer >= 1)
-      zerror("burnin_per should be -1 or in [0,1)");
-   if (mcmc.burninPer >= 0) {
-      if (mcmc.chunkSize < 1 || mcmc.maxSamples < 1 || mcmc.targetESS < 1)
-         zerror("chunk_size, max_samples, and target_ess should be positive");
+   if (mcmc.mode == MCMC_CLASSIC) {
+      if (mcmc.burnin < 0 || fabs(mcmc.burninFrac - mcmc.burnin) > 1e-12)
+         zerror("burnin should be a non-negative integer in classic mode");
+      if (mcmc.nsample < 1)
+         zerror("nsample should be positive");
+   }
+   else {
+      if (mcmc.burninFrac < 0 || mcmc.burninFrac >= 1)
+         zerror("burnin should be in [0,1) in dynamic mode");
+      if (mcmc.chunkSize < 1 || mcmc.nsample < 1 || mcmc.targetESS < 1)
+         zerror("chunk_size, nsample, and target_ess should be positive in dynamic mode");
       if (mcmc.targetRhat <= 1)
          zerror("target_rhat should be > 1");
    }
@@ -6006,7 +6026,7 @@ int MCMC(FILE* fout)
          if (AdaptiveChunkRun) {
 #if(!defined _WIN32)
             for (adaptive_next_samples = mcmc.chunkSize;
-               adaptive_next_samples <= mcmc.maxSamples
+               adaptive_next_samples <= mcmc.nsample
                && adaptive_next_samples + (mcmc.sampfreq > 1) <= existing_samples;
                adaptive_next_samples += mcmc.chunkSize) {
                if (AdaptiveWorkerPause(adaptive_next_samples))
@@ -6015,9 +6035,9 @@ int MCMC(FILE* fout)
 #endif
          }
          if (mcmc.print) {
-            if (mcmc.burninPer >= 0) {
+            if (mcmc.mode == MCMC_DYNAMIC) {
                int burnin_base = (AdaptiveChunkRun ? existing_samples : mcmc.nsample);
-               int burnin_samples = (int)(burnin_base * mcmc.burninPer + 0.5);
+               int burnin_samples = (int)(burnin_base * mcmc.burninFrac + 0.5);
                if (burnin_samples < 0) burnin_samples = 0;
                if (burnin_samples >= burnin_base) burnin_samples = burnin_base - 1;
                CreatePostBurninMCMCFile(com.mcmcf, "mcmc.postburnin.tmp", burnin_samples);
@@ -6056,7 +6076,7 @@ int MCMC(FILE* fout)
       adaptive_next_samples = mcmc.chunkSize;
       adaptive_next_records = adaptive_next_samples + (mcmc.sampfreq > 1);
 #if(!defined _WIN32)
-      while (autoresume && adaptive_next_samples <= mcmc.maxSamples
+      while (autoresume && adaptive_next_samples <= mcmc.nsample
          && adaptive_next_records <= existing_samples) {
          if (AdaptiveWorkerPause(adaptive_next_samples)) {
             adaptive_stop = 1;
@@ -6190,7 +6210,7 @@ int MCMC(FILE* fout)
          samples_this_run++;
          if (AdaptiveChunkRun) {
             total_records = existing_samples + samples_this_run;
-            if (adaptive_next_samples <= mcmc.maxSamples && total_records >= adaptive_next_records) {
+            if (adaptive_next_samples <= mcmc.nsample && total_records >= adaptive_next_records) {
                if (fmcmc) fflush(fmcmc);
                if (fdiag) fflush(fdiag);
                if (com.checkpoint == 1)
@@ -6244,14 +6264,14 @@ int MCMC(FILE* fout)
    printf("\nTime used: %s", printtime(timestr));
    fprintf(fout, "\nTime used: %s", printtime(timestr));
 
-   if (mcmc.burninPer >= 0) {
+   if (mcmc.mode == MCMC_DYNAMIC) {
       int burnin_base = mcmc.nsample;
       if (AdaptiveChunkRun) {
          summary_samples = CountMCMCSamples(com.mcmcf, expected_fields, 0, NULL, NULL);
          if (summary_samples > 0)
             burnin_base = summary_samples;
       }
-      int burnin_samples = (int)(burnin_base * mcmc.burninPer + 0.5);
+      int burnin_samples = (int)(burnin_base * mcmc.burninFrac + 0.5);
       if (burnin_samples < 0) burnin_samples = 0;
       if (burnin_samples >= burnin_base) burnin_samples = burnin_base - 1;
       CreatePostBurninMCMCFile(com.mcmcf, "mcmc.postburnin.tmp", burnin_samples);
@@ -6259,7 +6279,7 @@ int MCMC(FILE* fout)
    }
 
    fprintf(fout, "\n\nmean of parameters using %s iterations\n",
-      (mcmc.burninPer >= 0 ? "post-burnin" : "all"));
+      (mcmc.mode == MCMC_DYNAMIC ? "post-burnin" : "all"));
    for (i = 0; i < com.np; i++)  fprintf(fout, " %9.5f", mx[i]);
    fprintf(fout, "\n");
 
@@ -6275,7 +6295,7 @@ int MCMC(FILE* fout)
    fprintf(fout, "\n\n");  OutTreeN(fout, 1, 1);   fprintf(fout, "\n");
 
    if (mcmc.print) {
-      if (mcmc.burninPer >= 0) {
+      if (mcmc.mode == MCMC_DYNAMIC) {
          DescriptiveStatisticsSimpleMCMCTREE(fout, "mcmc.postburnin.tmp");
          remove("mcmc.postburnin.tmp");
       }

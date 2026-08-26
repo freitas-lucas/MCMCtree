@@ -24,16 +24,15 @@
 
       finetune = 1: 0.1  0.1  0.1  0.01 .5  * auto (0 or 1) : times, musigma2, rates, mixing, paras, FossilErr
 
+          mode = classic * classic: fixed burnin/nsample; dynamic: burnin is a fraction and nsample is the maximum per chain
          print = 1
         burnin = 8000
       sampfreq = 2
        nsample = 200000
 
         n_runs = 1   * number of independent MCMC runs to run in parallel
-    burnin_per = -1   * -1: classic burnin/nsample; >=0: adaptive chunks discard this fraction for diagnostics/summaries
     chunk_size = 1000 * adaptive mode: samples added per chain before checking convergence/ESS
    target_rhat = 1.01 * adaptive mode: stop after all parameters have Rhat <= target_rhat
     target_ess = 200  * adaptive mode: stop after combined post-burnin ESS reaches target_ess for all parameters
-   max_samples = 20000 * adaptive mode: maximum samples per chain
 
 *** Note: Make your window wider (100 columns) before running the program.
