@@ -12,7 +12,7 @@
          clock = 2 * 1: Global clock; 2: independent rates; 3: correlated rates
 *      RootAge = 'B(3.20,4.51,0.025,0.01)'  * safe constraint on root age, used if no fossil for root.
 
-         model = 0 * 0 : JC69, 1: K80, 2: F81, 3: F84, 4: HKY85
+         model = 0 * nucleotides: 0:JC69, 1:K80, 2:F81, 3:F84, 4:HKY85; AAs: LG, WAG, JTT, etc., or path/to/model.dat
          alpha = 0    * alpha for gamma rates at sites
          ncatG = 5    * No. categories In discrete gamma
    duplication = 1

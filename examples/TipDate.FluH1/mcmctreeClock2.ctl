@@ -17,7 +17,6 @@
         RootAge = B(1, 5, .001, .001)  * used if no fossil for root
 
          model = 4    * 0:JC69, 1:K80, 2:F81, 3:F84, 4:HKY85
-    aaRatefile = wag.dat
          alpha = 0.5    * alpha for gamma rates at sites
          ncatG = 5    * No. categories in discrete gamma
 

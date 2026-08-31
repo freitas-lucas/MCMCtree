@@ -340,7 +340,7 @@ void ResolveAARateFile(char cwd[], char argv0[])
 
    if (com.daafile[0] == '\0') return;
    if (com.seqtype != 2) {
-      printf("\nWarning: aaRatefile is ignored unless seqtype = 2.\n");
+      printf("\nWarning: amino-acid model file is ignored unless seqtype = 2.\n");
       return;
    }
    strncpy(value, com.daafile, sizeof(value) - 1);
@@ -399,8 +399,8 @@ void ResolveAARateFile(char cwd[], char argv0[])
    }
 
    if (known) {
-      printf("\naaRatefile = %s maps to %s, but the file was not found.\n", value, file);
-      zerror("set PAML_DATA_DIR or use aaRatefile with an explicit path");
+      printf("\nmodel = %s maps to %s, but the file was not found.\n", value, file);
+      zerror("set PAML_DATA_DIR or use model with an explicit amino-acid rate file path");
    }
 }
 
@@ -858,6 +858,15 @@ int main(int argc, char *argv[])
       zerror("getcwd failed");
    GetOptions(ctlf);
    ResolveAARateFile(cwd, argv[0]);
+   if (mcmc.mode == MCMC_DYNAMIC && mcmc.usedata == 4 && mcmc.nrun <= 1) {
+      printf("\nmode = dynamic requires n_runs > 1 for the MCMC step.\n");
+      printf("\nThis run has usedata = 4 and n_runs = 1. The program could generate the in.BV file,");
+      printf("\nbut the following dynamic MCMC step would fail because Rhat requires at least two independent chains.\n");
+      printf("\nIf you only want to generate the in.BV file, use usedata = 3.\n");
+      printf("\nIf you want to run the full single-step approximate-likelihood analysis with dynamic MCMC,");
+      printf("\nadd n_runs to the control file and set n_runs > 1.\n");
+      zerror("dynamic MCMC needs n_runs > 1");
+   }
    if (mcmc.usedata == 4) {
       char usedata2ctl[4096] = ".mcmctree.usedata2.ctl";
 
@@ -871,7 +880,7 @@ int main(int argc, char *argv[])
          fprintf(fout, "MCMCTREE (%s) %s\n", pamlVerStr, com.seqf);
          ReadTreeSeqs(fout);
          if (com.seqtype == 2 && com.model == 2 && com.daafile[0] == '\0')
-            zerror("seqtype = 2, model = 2, usedata = 4 requires aaRatefile");
+            zerror("for seqtype = 2 and usedata = 4, use model = LG, WAG, JTT, etc., or model = path/to/model.dat");
          printf("\nusedata = 4: generating approximate likelihood in %s and continuing with MCMC.\n", com.inBVf);
          GenerateBlengthGH(com.inBVf);
          fclose(fout);
@@ -1923,12 +1932,89 @@ int MeanMCMCFile(char infile[], int np, double mx[])
    return(0);
 }
 
+double MeanMCMCParamRun(double data[], int nr, int iparam, int n)
+{
+   int i;
+   double mean = 0;
+
+   for (i = 0; i < n; i++)
+      mean += data[iparam*nr + i] / n;
+   return(mean);
+}
+
+double AutocovMCMCParamRun(double data[], int nr, int iparam, int n, double mean, int lag)
+{
+   int i;
+   double acov = 0;
+
+   for (i = 0; i < n - lag; i++)
+      acov += (data[iparam*nr + i] - mean) * (data[iparam*nr + i + lag] - mean);
+   return(acov / n);
+}
+
+double EffectiveSizeMultiChain(double **run_data, int *nr, int nrun, int nmin, int iparam, double W, double varplus)
+{
+   double *mean, *rho, mean_acov, rho_even, rho_odd, pair, prev_pair, tau;
+   int irun, lag, maxlag, last = 0;
+
+   if (nrun < 2 || nmin < 4 || W <= 0 || varplus <= 0)
+      return(0);
+
+   mean = (double*)malloc(nrun * sizeof(double));
+   rho = (double*)malloc(nmin * sizeof(double));
+   if (mean == NULL || rho == NULL)
+      zerror("oom in EffectiveSizeMultiChain");
+
+   for (irun = 0; irun < nrun; irun++)
+      mean[irun] = MeanMCMCParamRun(run_data[irun], nr[irun], iparam, nmin);
+
+   rho[0] = 1;
+   maxlag = min2(2000, nmin - 1);
+   for (lag = 1; lag + 1 <= maxlag; lag += 2) {
+      mean_acov = 0;
+      for (irun = 0; irun < nrun; irun++)
+         mean_acov += AutocovMCMCParamRun(run_data[irun], nr[irun], iparam, nmin, mean[irun], lag) / nrun;
+      rho_odd = 1 - (W - mean_acov) / varplus;
+
+      mean_acov = 0;
+      for (irun = 0; irun < nrun; irun++)
+         mean_acov += AutocovMCMCParamRun(run_data[irun], nr[irun], iparam, nmin, mean[irun], lag + 1) / nrun;
+      rho_even = 1 - (W - mean_acov) / varplus;
+
+      if (rho_odd + rho_even < 0)
+         break;
+      rho[lag] = rho_odd;
+      rho[lag + 1] = rho_even;
+      last = lag + 1;
+   }
+
+   prev_pair = 1e300;
+   for (lag = 1; lag + 1 <= last; lag += 2) {
+      pair = rho[lag] + rho[lag + 1];
+      if (pair > prev_pair) {
+         rho[lag] = rho[lag + 1] = prev_pair / 2;
+      }
+      else
+         prev_pair = pair;
+   }
+
+   tau = -1;
+   for (lag = 0; lag <= last; lag++)
+      tau += 2 * rho[lag];
+   if (tau <= 0)
+      tau = 1;
+
+   free(mean);
+   free(rho);
+   return(nrun * nmin / tau);
+}
+
 int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
    FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin)
 {
    char filename[256], header[100000];
    char *header_copy, *token, **check_name;
-   double **run_data, *y = NULL, *rhats, mean, var, rho1, W, B, grand, rhat, eff, ess;
+   double **run_data, *rhats, *Ws, *varplus, W, B, grand, rhat, ess;
    int *nr, *cols, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
    FILE *fin;
 
@@ -1989,7 +2075,9 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
    *rhat_pass = 1;
    *ess_pass = 1;
    rhats = (double*)malloc(ncheck * sizeof(double));
-   if (rhats == NULL) zerror("oom rhats in CheckConvergenceESS");
+   Ws = (double*)malloc(ncheck * sizeof(double));
+   varplus = (double*)malloc(ncheck * sizeof(double));
+   if (rhats == NULL || Ws == NULL || varplus == NULL) zerror("oom rhats in CheckConvergenceESS");
    nmin = nr[0];
    for (irun = 1; irun < nrun; irun++)
       if (nr[irun] < nmin) nmin = nr[irun];
@@ -2026,6 +2114,8 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
          B += square(means[irun] - grand) * nmin / (nrun - 1);
       }
       rhat = (nmin > 1 && W > 0 ? sqrt(((nmin - 1.0) / nmin * W + B / nmin) / W) : 99);
+      Ws[j] = W;
+      varplus[j] = (nmin - 1.0) / nmin * W + B / nmin;
       rhats[j] = rhat;
       if (rhat > *max_rhat) *max_rhat = rhat;
       if (rhat > target_rhat)
@@ -2045,18 +2135,8 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
       }
    }
    else {
-      y = (double*)malloc(nmin * sizeof(double));
-      if (y == NULL) zerror("oom y in CheckConvergenceESS");
       for (j = 0; j < ncheck; j++) {
-         ess = 0;
-         if (nmin > 1) {
-            for (irun = 0; irun < nrun; irun++) {
-               for (i = 0; i < nmin; i++)
-                  y[i] = run_data[irun][j*nr[irun] + i];
-               eff = Eff_IntegratedCorrelationTime(y, nmin, &mean, &var, &rho1);
-               ess += nmin * eff;
-            }
-         }
+         ess = EffectiveSizeMultiChain(run_data, nr, nrun, nmin, j, Ws[j], varplus[j]);
          if (ess < *min_ess) *min_ess = ess;
          if (ess < target_ess)
             *ess_pass = 0;
@@ -2074,11 +2154,12 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
    free(nr);
    free(cols);
    free(rhats);
+   free(Ws);
+   free(varplus);
    for (j = 0; j < p; j++)
       free(check_name[j]);
    free(check_name);
    free(header_copy);
-   if (y) free(y);
    return(pass);
 }
 
@@ -2938,14 +3019,14 @@ int GenerateBlengthGH(char infile[])
 int GetOptions(char *ctlf)
 {
    int  transform0 = ARCSIN_B; /* default transform: SQRT_B, LOG_B, ARCSIN_B */
-   int  iopt, i, j, nopt = 38, lline = 4096;
+   int  iopt, i, j, nopt = 36, lline = 4096;
    char line[4096], *pline, opt[33], *comment = "*#", ch;
    char *optstr[] = { "seed", "seqfile","treefile", "outfile", "mcmcfile", "checkpoint", "BayesFactorBeta",
-        "seqtype", "aaRatefile", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
+        "seqtype", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
         "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
         "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs",
-        "chunk_size", "target_rhat", "target_ess", "aaRateFile", "mode" };
+        "chunk_size", "target_rhat", "target_ess", "mode" };
    double t = 1, *eps = mcmc.steplength;
    FILE  *fctl = zfopen(ctlf, "r");
 
@@ -2990,10 +3071,9 @@ int GetOptions(char *ctlf)
                case (5): sscanf(pline + 1, "%d%lf%s", &com.checkpoint, &com.checkpointp, com.checkpointf); break;
                case (6): sscanf(pline + 1, "%lf", &BFbeta);    break; /* beta for marginal likelihood */
                case (7): com.seqtype = (int)t;    break;
-               case (8): sscanf(pline + 1, "%s", com.daafile);  break;
-               case (9): com.icode = (int)t;      break;
-               case (10): noisy = (int)t;          break;
-               case (11):
+               case (8): com.icode = (int)t;      break;
+               case (9): noisy = (int)t;          break;
+               case (10):
                   j = sscanf(pline + 1, "%d %s%d", &mcmc.usedata, com.inBVf, &data.transform);
                   if (mcmc.usedata == 2 || mcmc.usedata == 4) {
                      if (strchr(com.inBVf, '*')) { 
@@ -3004,26 +3084,36 @@ int GetOptions(char *ctlf)
                         data.transform = transform0;
                   }
                   break;
-               case (12): com.ndata = (int)t;           break;
-               case (13): stree.duplication = (int)t;   break;
-               case (14):
+               case (11): com.ndata = (int)t;           break;
+               case (12): stree.duplication = (int)t;   break;
+               case (13):
                   {
-                     char modelstr[64], upper[64];
+                     char modelstr[2048], upper[2048], *end;
                      int k;
-                     sscanf(pline + 1, "%63s", modelstr);
-                     for (k = 0; modelstr[k] && k < 63; k++)
+                     sscanf(pline + 1, "%2047s", modelstr);
+                     t = strtod(modelstr, &end);
+                     if (end > modelstr && *end == '\0') {
+                        com.model = (int)t;
+                        com.daafile[0] = '\0';
+                        break;
+                     }
+                     for (k = 0; modelstr[k] && k < (int)sizeof(upper) - 1; k++)
                         upper[k] = (char)toupper((unsigned char)modelstr[k]);
                      upper[k] = '\0';
-                     com.model = (!strcmp(upper, "AA") ? -1 : (int)t);
+                     if (!strcmp(upper, "AA"))
+                        zerror("use model = LG, WAG, JTT, etc., or model = path/to/model.dat for amino-acid models");
+                     com.model = -1;
+                     strncpy(com.daafile, modelstr, sizeof(com.daafile) - 1);
+                     com.daafile[sizeof(com.daafile) - 1] = '\0';
                   }
                   break;
-               case (15): com.clock = (int)t;           break;
-               case (16):
+               case (14): com.clock = (int)t;           break;
+               case (15):
                   sscanf(pline + 2, "%d%lf", &tipdate.flag, &tipdate.timeunit);
                   if (tipdate.flag && tipdate.timeunit == 0) zerror("should set tipdate.timeunit");
                   data.transform = SQRT_B;  /* SQRT_B, LOG_B, ARCSIN_B */
                   break;
-               case (17):
+               case (16):
                   stree.RootAge[2] = stree.RootAge[3] = 0.025;  /* default tail probs */
                   if ((strchr(line, '>') || strchr(line, '<')) && (strstr(line, "U(") || strstr(line, "B(")))
                      zerror("don't mix < U B on the RootAge line");
@@ -3038,15 +3128,15 @@ int GetOptions(char *ctlf)
                   else if ((pline = strstr(line, "B(")))
                      sscanf(pline + 2, "%lf,%lf,%lf,%lf", &stree.RootAge[0], &stree.RootAge[1], &stree.RootAge[2], &stree.RootAge[3]);
                   break;
-               case (18):
+               case (17):
                   data.pfossilerror[0] = 0.0;
                   data.pfossilerror[2] = 1;  /* default: minimum 2 good fossils */
                   sscanf(pline + 1, "%lf%lf%lf", data.pfossilerror, data.pfossilerror + 1, data.pfossilerror + 2);
                   break;
-               case (19): com.alpha = t;           break;
-               case (20): com.ncatG = (int)t;      break;
-               case (21): com.cleandata = (int)t;  break;
-               case (22):
+               case (18): com.alpha = t;           break;
+               case (19): com.ncatG = (int)t;      break;
+               case (20): com.cleandata = (int)t;  break;
+               case (21):
                   data.BDS[3] = -1;  /* there may be either 3 or 4 parameters in the BDS model. */
                   sscanf(pline + 1, "%lf%lf%lf%lf %c", &data.BDS[0], &data.BDS[1], &data.BDS[2], &data.BDS[3], &ch);
                   if (data.BDS[3] <= 0)
@@ -3056,34 +3146,33 @@ int GetOptions(char *ctlf)
                   else if (ch == 'M')  data.BDS_flag = 1;
                   else                 zerror("BDparas: expect flag for birth-death process prior: C for conditional, M for multiplicative");
                   break;                 
-               case (23):
+               case (22):
                   sscanf(pline + 1, "%lf%lf", data.kappagamma, data.kappagamma + 1); break;
-               case (24):
+               case (23):
                   sscanf(pline + 1, "%lf%lf", data.alphagamma, data.alphagamma + 1); break;
-               case (25):
+               case (24):
                   sscanf(pline + 1, "%lf%lf%lf%d", &data.rgenepara[0], &data.rgenepara[1], &data.rgenepara[2], &data.rgeneprior);
                   if (data.rgenepara[2] <= 0)  data.rgenepara[2] = 1;
                   if (data.rgeneprior < 0)     data.rgeneprior = 0;
                   break;
-               case (26):
+               case (25):
                   sscanf(pline + 1, "%lf%lf%lf", data.sigma2para, data.sigma2para + 1, data.sigma2para + 2);
                   if (data.sigma2para[2] <= 0) data.sigma2para[2] = 1;
                   break;
-               case (27): mcmc.print = (int)t;     break;
-               case (28): mcmc.burnin = (int)t; mcmc.burninFrac = t; break;
-               case (29): mcmc.sampfreq = (int)t;  break;
-               case (30): mcmc.nsample = (int)t;   break;
-               case (31):
+               case (26): mcmc.print = (int)t;     break;
+               case (27): mcmc.burnin = (int)t; mcmc.burninFrac = t; break;
+               case (28): mcmc.sampfreq = (int)t;  break;
+               case (29): mcmc.nsample = (int)t;   break;
+               case (30):
                   puts("finetune is deprecated now.");
                   break;
                   sscanf(pline + 1, "%d:%lf%lf%lf%lf%lf%lf", &j, eps, eps + 1, eps + 2, eps + 3, eps + 4, eps + 5);
                   break;
-               case (32): mcmc.nrun = (int)t;        break;
-               case (33): mcmc.chunkSize = (int)t;   break;
-               case (34): mcmc.targetRhat = t;       break;
-               case (35): mcmc.targetESS = (int)t;   break;
-               case (36): sscanf(pline + 1, "%s", com.daafile); break;
-               case (37):
+               case (31): mcmc.nrun = (int)t;        break;
+               case (32): mcmc.chunkSize = (int)t;   break;
+               case (33): mcmc.targetRhat = t;       break;
+               case (34): mcmc.targetESS = (int)t;   break;
+               case (35):
                   {
                      char modestr[64], upper[64];
                      int k;
@@ -3137,7 +3226,7 @@ int GetOptions(char *ctlf)
       if (com.seqtype == 1) com.ncode = 61;
    }
    if (com.model == -1 && com.seqtype != 2)
-      zerror("model = AA is only valid with seqtype = 2");
+      zerror("non-numeric model names or paths are only valid with seqtype = 2");
    if (com.seqtype == 1) {
       if (mcmc.usedata == 3) 
          zerror("you can run codeml outside mcmctree to implement codon models to work with mcmctree");

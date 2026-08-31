@@ -9,7 +9,7 @@
        usedata = 1 * 0: no data; 1:seq Like; 2:normal approximation; 3:out.BV(in.BV)
      cleandata = 0 * remove sites with ambiguity data (1:yes, 0:no)?
 
-         model = 0  * 0 : JC69, 1: K80, 2: F81, 3: F84, 4: HKY85
+         model = 0  * nucleotides: 0:JC69, 1:K80, 2:F81, 3:F84, 4:HKY85; AAs: LG, WAG, JTT, etc., or path/to/model.dat
          alpha = 0  * alpha for gamma rates at sites
          ncatG = 5  * No. categories In discrete gamma
          clock = 2  * 1: Global clock; 2: independent rates; 3: correlated rates
