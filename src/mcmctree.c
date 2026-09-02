@@ -94,11 +94,13 @@ int collectx(FILE* fout, double x[]);
 int MCMC(FILE* fout);
 int FileExists(char *filename);
 int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastgen, int *nskipped);
+int CountMCMCRecordsLoose(char *filename);
+int MinCompletedAdaptiveSamples(int nrun, int chunk_size);
 int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, int *lastgen);
 int SetupAdaptiveParallelRuns(char cwd[]);
 int CombineRunsPostBurnin(char outfile[], int nrun, int burnin_samples);
 int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
-   FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin);
+   double target_node_fraction, FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin);
 int CreatePostBurninMCMCFile(char infile[], char outfile[], int burnin_samples);
 int MeanMCMCFile(char infile[], int np, double mx[]);
 int LabelOldCondP(int spnode);
@@ -214,7 +216,7 @@ struct MCMCPARAMETERS {
    int mode, chunkSize, targetESS;
    int nsteplength, steplengthOffset[8];
    char  *accept;
-   double burninFrac, targetRhat;
+   double burninFrac, targetRhat, targetNodeFraction;
    double *steplength, *Pjump;
 }  mcmc; /* control parameters */
 
@@ -611,6 +613,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
    int target_samples, done = 0, round = 0, current_pass = 0, consecutive_pass = 0;
    int rhat_pass = 0, ess_pass = 0, postburnin_per_run = 0, combined_postburnin = 0;
    int final_samples = 0, final_burnin_samples = 0, irun, status, failed = 0, seed;
+   int resume_completed_samples = 0, have_stats = 0, have_param_stats = 0;
    double max_rhat = 99, min_ess = 0;
    char combinedf[256] = "combined_mcmc.txt";
    char rundir[64], command;
@@ -635,15 +638,28 @@ int SetupAdaptiveParallelRuns(char cwd[])
       MakeAbsolutePath(com.daafile, cwd);
 
    printf("\nDynamic MCMC with %d independent runs.\n", mcmc.nrun);
-   printf("chunk_size = %d, burnin = %.4f, target_rhat = %.4f, target_ess = %d, max nsample = %d\n",
-      mcmc.chunkSize, mcmc.burninFrac, mcmc.targetRhat, mcmc.targetESS, mcmc.nsample);
+   printf("chunk_size = %d, burnin = %.4f, target_rhat = %.4f, target_ess = %d, target_node_fraction = %.4f, max nsample = %d\n",
+      mcmc.chunkSize, mcmc.burninFrac, mcmc.targetRhat, mcmc.targetESS, mcmc.targetNodeFraction, mcmc.nsample);
    printf("Persistent adaptive workers: each run reads input files once and pauses at chunk boundaries.\n");
 
-   fstats = zfopen("adaptive_stats.txt", "w");
-   fprintf(fstats, "chunk\tsamples_per_run\tburnin_samples\tpostburnin_per_run\tcombined_postburnin_samples\tmax_rhat\tmin_ess\trhat_pass\tess_pass\tconsecutive_pass\tstop\n");
+   if (original_checkpoint == 2 || original_checkpoint == 3) {
+      resume_completed_samples = MinCompletedAdaptiveSamples(mcmc.nrun, mcmc.chunkSize);
+      if (resume_completed_samples > mcmc.nsample)
+         resume_completed_samples = mcmc.nsample;
+      if (resume_completed_samples > 0)
+         printf("Adaptive resume: found at least %d completed samples/run; diagnostics will continue from the next chunk.\n",
+            resume_completed_samples);
+   }
+
+   have_stats = FileExists("adaptive_stats.txt");
+   fstats = zfopen("adaptive_stats.txt", resume_completed_samples > 0 && have_stats ? "a" : "w");
+   if (resume_completed_samples == 0 || !have_stats)
+      fprintf(fstats, "chunk\tsamples_per_run\tburnin_samples\tpostburnin_per_run\tcombined_postburnin_samples\tmax_rhat\tmin_ess\trhat_pass\tess_pass\tconsecutive_pass\tstop\n");
    fclose(fstats);
-   fparam = zfopen("adaptive_stats_by_parameter.txt", "w");
-   fprintf(fparam, "chunk\tsamples_per_run\tburnin_samples\tparameter\trhat\tess\trhat_pass\tess_pass\n");
+   have_param_stats = FileExists("adaptive_stats_by_parameter.txt");
+   fparam = zfopen("adaptive_stats_by_parameter.txt", resume_completed_samples > 0 && have_param_stats ? "a" : "w");
+   if (resume_completed_samples == 0 || !have_param_stats)
+      fprintf(fparam, "chunk\tsamples_per_run\tburnin_samples\tparameter\trhat\tess\trhat_pass\tess_pass\n");
    fclose(fparam);
 
    pids = (pid_t*)malloc(mcmc.nrun * sizeof(pid_t));
@@ -707,7 +723,35 @@ int SetupAdaptiveParallelRuns(char cwd[])
       close(to_child[irun][0]);
    }
 
-   for (target_samples = mcmc.chunkSize; target_samples <= mcmc.nsample; target_samples += mcmc.chunkSize) {
+   for (target_samples = mcmc.chunkSize; target_samples <= resume_completed_samples; target_samples += mcmc.chunkSize) {
+      round++;
+      printf("\nAdaptive resume: acknowledging completed round %d (%d samples/run).\n", round, target_samples);
+      for (irun = 0; irun < mcmc.nrun; irun++) {
+         int worker_samples = 0;
+         if (ReadFullFD(to_parent[irun][0], &worker_samples, sizeof(int)) != 1) {
+            failed = 1;
+            break;
+         }
+         if (worker_samples != target_samples)
+            printf("\n[run%d] reached %d samples while parent expected completed chunk %d.\n",
+               irun + 1, worker_samples, target_samples);
+      }
+      if (failed)
+         break;
+      command = (target_samples + mcmc.chunkSize > mcmc.nsample ? 'S' : 'C');
+      for (irun = 0; irun < mcmc.nrun; irun++)
+         if (WriteFullFD(to_child[irun][1], &command, sizeof(char)) != 1)
+            failed = 1;
+      if (failed || command == 'S') {
+         final_samples = target_samples;
+         final_burnin_samples = (int)(target_samples * mcmc.burninFrac + 0.5);
+         if (final_burnin_samples < 0) final_burnin_samples = 0;
+         if (final_burnin_samples >= final_samples) final_burnin_samples = final_samples - 1;
+         break;
+      }
+   }
+
+   for (target_samples = resume_completed_samples + mcmc.chunkSize; !failed && target_samples <= mcmc.nsample; target_samples += mcmc.chunkSize) {
       int burnin_samples = (int)(target_samples * mcmc.burninFrac + 0.5);
 
       round++;
@@ -730,6 +774,7 @@ int SetupAdaptiveParallelRuns(char cwd[])
 
       fparam = zfopen("adaptive_stats_by_parameter.txt", "a");
       current_pass = CheckConvergenceESS(mcmc.nrun, burnin_samples, mcmc.targetRhat, (double)mcmc.targetESS, &max_rhat, &min_ess,
+         mcmc.targetNodeFraction,
          fparam, round, target_samples, &rhat_pass, &ess_pass, &postburnin_per_run, &combined_postburnin);
       fclose(fparam);
       final_samples = target_samples;
@@ -800,8 +845,8 @@ int SetupAdaptiveParallelRuns(char cwd[])
    fprintf(fout, "MCMCTREE combined summary (%s) %s\n", pamlVerStr, com.seqf);
    ReadTreeSeqs(fout);
    fprintf(fout, "\nAdaptive MCMC summary across %d independent runs\n", mcmc.nrun);
-   fprintf(fout, "mode = dynamic  burnin = %.4f  target_rhat = %.4f  target_ess = %d  nsample = %d  final_samples = %d\n",
-      mcmc.burninFrac, mcmc.targetRhat, mcmc.targetESS, mcmc.nsample, final_samples);
+   fprintf(fout, "mode = dynamic  burnin = %.4f  target_rhat = %.4f  target_ess = %d  target_node_fraction = %.4f  nsample = %d  final_samples = %d\n",
+      mcmc.burninFrac, mcmc.targetRhat, mcmc.targetESS, mcmc.targetNodeFraction, mcmc.nsample, final_samples);
    fprintf(fout, "Final diagnostics: max Rhat = %.5f  min ESS = %.1f\n", max_rhat, min_ess);
    DescriptiveStatisticsSimpleMCMCTREE(fout, combinedf);
    fclose(fout);
@@ -1932,64 +1977,220 @@ int MeanMCMCFile(char infile[], int np, double mx[])
    return(0);
 }
 
-double MeanMCMCParamRun(double data[], int nr, int iparam, int n)
-{
-   int i;
-   double mean = 0;
+typedef struct {
+   double x;
+   int index;
+} RankedDraw;
 
-   for (i = 0; i < n; i++)
-      mean += data[iparam*nr + i] / n;
-   return(mean);
+/* Rank-normalized split-chain diagnostics following Vehtari et al. (2021). */
+int CompareRankedDraw(const void *a, const void *b)
+{
+   double x = ((const RankedDraw*)a)->x, y = ((const RankedDraw*)b)->x;
+   return((x > y) - (x < y));
 }
 
-double AutocovMCMCParamRun(double data[], int nr, int iparam, int n, double mean, int lag)
+void FreeChainMatrix(double **chain, int nchain)
 {
    int i;
+
+   if (chain == NULL) return;
+   for (i = 0; i < nchain; i++)
+      free(chain[i]);
+   free(chain);
+}
+
+double **AllocChainMatrix(int nchain, int n)
+{
+   double **chain;
+   int i;
+
+   chain = (double**)malloc(nchain * sizeof(double*));
+   if (chain == NULL)
+      zerror("oom in AllocChainMatrix");
+   for (i = 0; i < nchain; i++) {
+      chain[i] = (double*)malloc(n * sizeof(double));
+      if (chain[i] == NULL)
+         zerror("oom in AllocChainMatrix");
+   }
+   return(chain);
+}
+
+double MedianCopy(double x[], int n)
+{
+   double *y, median;
+
+   y = (double*)malloc(n * sizeof(double));
+   if (y == NULL)
+      zerror("oom in MedianCopy");
+   memcpy(y, x, n * sizeof(double));
+   qsort(y, (size_t)n, sizeof(double), comparedouble);
+   median = (n % 2 ? y[n / 2] : (y[n / 2 - 1] + y[n / 2]) / 2);
+   free(y);
+   return(median);
+}
+
+double **SplitRankNormalizeParam(double **run_data, int *nr, int nrun, int nmin, int iparam, int folded, int *nchain_out, int *n_out)
+{
+   double **chain, *raw, *allraw = NULL, median = 0, x, rank, prob;
+   RankedDraw *draw;
+   int nsplit = nmin / 2, nchain = nrun * 2, ntotal = nchain * nsplit;
+   int irun, i, k, start, end;
+
+   if (nsplit < 2)
+      zerror("too few post-burnin samples for split Rhat");
+
+   raw = (double*)malloc(ntotal * sizeof(double));
+   draw = (RankedDraw*)malloc(ntotal * sizeof(RankedDraw));
+   if (raw == NULL || draw == NULL)
+      zerror("oom in SplitRankNormalizeParam");
+
+   if (folded) {
+      allraw = (double*)malloc(nrun * nmin * sizeof(double));
+      if (allraw == NULL)
+         zerror("oom in SplitRankNormalizeParam");
+      k = 0;
+      for (irun = 0; irun < nrun; irun++)
+         for (i = 0; i < nmin; i++)
+            allraw[k++] = run_data[irun][iparam*nr[irun] + i];
+      median = MedianCopy(allraw, nrun * nmin);
+      free(allraw);
+   }
+
+   k = 0;
+   for (irun = 0; irun < nrun; irun++) {
+      for (i = 0; i < nsplit; i++) {
+         x = run_data[irun][iparam*nr[irun] + i];
+         raw[k++] = (folded ? fabs(x - median) : x);
+      }
+      for (i = nmin - nsplit; i < nmin; i++) {
+         x = run_data[irun][iparam*nr[irun] + i];
+         raw[k++] = (folded ? fabs(x - median) : x);
+      }
+   }
+
+   for (i = 0; i < ntotal; i++) {
+      draw[i].x = raw[i];
+      draw[i].index = i;
+   }
+   qsort(draw, (size_t)ntotal, sizeof(RankedDraw), CompareRankedDraw);
+
+   chain = AllocChainMatrix(nchain, nsplit);
+   for (i = 0; i < ntotal; ) {
+      start = i;
+      while (i + 1 < ntotal && draw[i + 1].x == draw[start].x)
+         i++;
+      end = i;
+      rank = (start + 1 + end + 1) / 2.0;
+      prob = (rank - 0.375) / (ntotal + 0.25);
+      for (k = start; k <= end; k++)
+         chain[draw[k].index / nsplit][draw[k].index % nsplit] = QuantileNormal(prob);
+      i++;
+   }
+
+   free(raw);
+   free(draw);
+   *nchain_out = nchain;
+   *n_out = nsplit;
+   return(chain);
+}
+
+double RhatChainMatrix(double **chain, int nchain, int n, double *Wout, double *varplus_out)
+{
+   double *mean, *var, grand = 0, W = 0, B = 0, varplus, rhat;
+   int ichain, i;
+
+   mean = (double*)malloc(nchain * sizeof(double));
+   var = (double*)malloc(nchain * sizeof(double));
+   if (mean == NULL || var == NULL)
+      zerror("oom in RhatChainMatrix");
+
+   for (ichain = 0; ichain < nchain; ichain++) {
+      mean[ichain] = 0;
+      for (i = 0; i < n; i++)
+         mean[ichain] += chain[ichain][i] / n;
+      grand += mean[ichain] / nchain;
+   }
+   for (ichain = 0; ichain < nchain; ichain++) {
+      var[ichain] = 0;
+      for (i = 0; i < n; i++)
+         var[ichain] += square(chain[ichain][i] - mean[ichain]) / (n - 1);
+      W += var[ichain] / nchain;
+      B += square(mean[ichain] - grand) * n / (nchain - 1);
+   }
+   varplus = (n - 1.0) / n * W + B / n;
+   rhat = (n > 1 && W > 0 ? sqrt(varplus / W) : 99);
+   if (Wout) *Wout = W;
+   if (varplus_out) *varplus_out = varplus;
+
+   free(mean);
+   free(var);
+   return(rhat);
+}
+
+double AutocovChain(double x[], int n, double mean, int lag)
+{
    double acov = 0;
+   int i;
 
    for (i = 0; i < n - lag; i++)
-      acov += (data[iparam*nr + i] - mean) * (data[iparam*nr + i + lag] - mean);
+      acov += (x[i] - mean) * (x[i + lag] - mean);
    return(acov / n);
 }
 
-double EffectiveSizeMultiChain(double **run_data, int *nr, int nrun, int nmin, int iparam, double W, double varplus)
+double EffectiveSizeMultiChain(double **chain, int nchain, int n, double W, double varplus)
 {
-   double *mean, *rho, mean_acov, rho_even, rho_odd, pair, prev_pair, tau;
-   int irun, lag, maxlag, last = 0;
+   double *mean, *rho, mean_acov, rho_even, rho_odd, pair, prev_pair, tau, ess;
+   int ichain, i, lag, t, max_t;
 
-   if (nrun < 2 || nmin < 4 || W <= 0 || varplus <= 0)
+   if (nchain < 2 || n < 3 || W <= 0 || varplus <= 0)
       return(0);
 
-   mean = (double*)malloc(nrun * sizeof(double));
-   rho = (double*)malloc(nmin * sizeof(double));
+   mean = (double*)malloc(nchain * sizeof(double));
+   rho = (double*)calloc((size_t)n, sizeof(double));
    if (mean == NULL || rho == NULL)
       zerror("oom in EffectiveSizeMultiChain");
 
-   for (irun = 0; irun < nrun; irun++)
-      mean[irun] = MeanMCMCParamRun(run_data[irun], nr[irun], iparam, nmin);
-
-   rho[0] = 1;
-   maxlag = min2(2000, nmin - 1);
-   for (lag = 1; lag + 1 <= maxlag; lag += 2) {
-      mean_acov = 0;
-      for (irun = 0; irun < nrun; irun++)
-         mean_acov += AutocovMCMCParamRun(run_data[irun], nr[irun], iparam, nmin, mean[irun], lag) / nrun;
-      rho_odd = 1 - (W - mean_acov) / varplus;
-
-      mean_acov = 0;
-      for (irun = 0; irun < nrun; irun++)
-         mean_acov += AutocovMCMCParamRun(run_data[irun], nr[irun], iparam, nmin, mean[irun], lag + 1) / nrun;
-      rho_even = 1 - (W - mean_acov) / varplus;
-
-      if (rho_odd + rho_even < 0)
-         break;
-      rho[lag] = rho_odd;
-      rho[lag + 1] = rho_even;
-      last = lag + 1;
+   for (ichain = 0; ichain < nchain; ichain++) {
+      mean[ichain] = 0;
+      for (i = 0; i < n; i++)
+         mean[ichain] += chain[ichain][i] / n;
    }
 
-   prev_pair = 1e300;
-   for (lag = 1; lag + 1 <= last; lag += 2) {
+   /* posterior::ess_bulk uses Geyer's initial positive and monotone sequence
+      with an extra positive autocorrelation term for antithetic chains. */
+   rho[0] = 1;
+   mean_acov = 0;
+   for (ichain = 0; ichain < nchain; ichain++)
+      mean_acov += AutocovChain(chain[ichain], n, mean[ichain], 1) / nchain;
+   rho_odd = 1 - (W - mean_acov) / varplus;
+   rho[1] = rho_odd;
+
+   t = 0;
+   rho_even = 1;
+   while (t < n - 5 && !isnan(rho_even + rho_odd) && rho_even + rho_odd > 0) {
+      t += 2;
+
+      mean_acov = 0;
+      for (ichain = 0; ichain < nchain; ichain++)
+         mean_acov += AutocovChain(chain[ichain], n, mean[ichain], t) / nchain;
+      rho_even = 1 - (W - mean_acov) / varplus;
+
+      mean_acov = 0;
+      for (ichain = 0; ichain < nchain; ichain++)
+         mean_acov += AutocovChain(chain[ichain], n, mean[ichain], t + 1) / nchain;
+      rho_odd = 1 - (W - mean_acov) / varplus;
+
+      if (rho_even + rho_odd >= 0) {
+         rho[t] = rho_even;
+         rho[t + 1] = rho_odd;
+      }
+   }
+   max_t = t;
+   if (rho_even > 0)
+      rho[max_t] = rho_even;
+
+   prev_pair = rho[0] + rho[1];
+   for (lag = 2; lag <= max_t - 2; lag += 2) {
       pair = rho[lag] + rho[lag + 1];
       if (pair > prev_pair) {
          rho[lag] = rho[lag + 1] = prev_pair / 2;
@@ -1999,23 +2200,29 @@ double EffectiveSizeMultiChain(double **run_data, int *nr, int nrun, int nmin, i
    }
 
    tau = -1;
-   for (lag = 0; lag <= last; lag++)
-      tau += 2 * rho[lag];
-   if (tau <= 0)
-      tau = 1;
+   if (max_t == 0)
+      tau += 2 * rho[0];
+   else
+      for (lag = 0; lag < max_t; lag++)
+         tau += 2 * rho[lag];
+   tau += rho[max_t];
+   ess = nchain * n;
+   if (tau < 1 / log10(ess))
+      tau = 1 / log10(ess);
 
    free(mean);
    free(rho);
-   return(nrun * nmin / tau);
+   return(ess / tau);
 }
 
 int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double target_ess, double *max_rhat, double *min_ess,
-   FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin)
+   double target_node_fraction, FILE *fparam, int chunk, int samples_per_run, int *rhat_pass, int *ess_pass, int *postburnin_per_run, int *combined_postburnin)
 {
    char filename[256], header[100000];
    char *header_copy, *token, **check_name;
-   double **run_data, *rhats, *Ws, *varplus, W, B, grand, rhat, ess;
-   int *nr, *cols, p = 0, p2 = 0, ncombined = 0, irun, j, i, nmin, pass = 1, ncheck = 0;
+   double **run_data, **rank_chain, **fold_chain, *rhats, *node_rhats, *Ws, *varplus, W, rhat, folded_rhat, ess, lnl_rhat = 0;
+   int *nr, *cols, *is_node, *is_lnl, p = 0, p2 = 0, ncombined = 0, irun, j, nmin, nsplit = 0, nchain = 0, pass = 1, ncheck = 0;
+   int nnode_check = 0, inode_rhat = 0, node_rhat_pass = 0, required_node_pass = 0, has_lnl = 0, lnl_rhat_pass = 1, check_ess;
    FILE *fin;
 
    if (nrun < 2)
@@ -2033,12 +2240,15 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
 
    check_name = (char**)malloc(p * sizeof(char*));
    cols = (int*)malloc(p * sizeof(int));
+   is_node = (int*)malloc(p * sizeof(int));
+   is_lnl = (int*)malloc(p * sizeof(int));
    header_copy = (char*)malloc((strlen(header) + 1) * sizeof(char));
-   if (check_name == NULL || cols == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
+   if (check_name == NULL || cols == NULL || is_node == NULL || is_lnl == NULL || header_copy == NULL) zerror("oom header in CheckConvergenceESS");
    for (j = 0; j < p; j++) {
       check_name[j] = (char*)malloc(64 * sizeof(char));
       if (check_name[j] == NULL) zerror("oom check_name in CheckConvergenceESS");
       check_name[j][0] = '\0';
+      is_node[j] = is_lnl[j] = 0;
    }
    strcpy(header_copy, header);
    for (j = 0, token = strtok(header_copy, " \t\r\n"); token && j < p; j++, token = strtok(NULL, " \t\r\n")) {
@@ -2046,6 +2256,10 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
          strncpy(check_name[ncheck], token, 63);
          check_name[ncheck][63] = '\0';
          cols[ncheck] = j;
+         is_node[ncheck] = (strncmp(token, "t_n", 3) == 0);
+         is_lnl[ncheck] = (strcmp(token, "lnL") == 0);
+         if (is_node[ncheck]) nnode_check++;
+         if (is_lnl[ncheck]) has_lnl = 1;
          ncheck++;
       }
    }
@@ -2067,62 +2281,72 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
          sprintf(filename, "run%d/%s", irun + 1, com.mcmcf);
          ReadMCMCColumnsPostBurnin(filename, burnin_samples, samples_per_run + (mcmc.sampfreq > 1), p, ncheck, cols, &nr[irun], &run_data[irun]);
       }
-      if (nr[irun] < 2) pass = 0;
+      if (nr[irun] < 4) pass = 0;
    }
 
+   required_node_pass = (int)ceil(target_node_fraction * nnode_check);
+   if (required_node_pass < 1 && nnode_check > 0)
+      required_node_pass = 1;
    *max_rhat = 0;
    *min_ess = 1e300;
    *rhat_pass = 1;
    *ess_pass = 1;
    rhats = (double*)malloc(ncheck * sizeof(double));
+   node_rhats = (double*)malloc(max2(nnode_check, 1) * sizeof(double));
    Ws = (double*)malloc(ncheck * sizeof(double));
    varplus = (double*)malloc(ncheck * sizeof(double));
-   if (rhats == NULL || Ws == NULL || varplus == NULL) zerror("oom rhats in CheckConvergenceESS");
+   if (rhats == NULL || node_rhats == NULL || Ws == NULL || varplus == NULL) zerror("oom rhats in CheckConvergenceESS");
    nmin = nr[0];
    for (irun = 1; irun < nrun; irun++)
       if (nr[irun] < nmin) nmin = nr[irun];
-   ncombined = nmin * nrun;
-   *postburnin_per_run = nmin;
+   nsplit = nmin / 2;
+   ncombined = nsplit * 2 * nrun;
+   *postburnin_per_run = nsplit * 2;
    *combined_postburnin = ncombined;
-   if (nmin < 2 || ncombined < 2) {
+   if (nmin < 4 || ncombined < 4) {
       pass = 0;
       *rhat_pass = 0;
       *ess_pass = 0;
+      *max_rhat = 99;
+      *min_ess = -1;
+      if (fparam) {
+         for (j = 0; j < ncheck; j++)
+            fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t\t%d\t%d\n",
+               chunk, samples_per_run, burnin_samples, check_name[j], 99.0, 0, 0);
+      }
+      goto cleanup;
    }
 
    for (j = 0; j < ncheck; j++) {
-      double *means, *vars;
-
-      means = (double*)malloc(nrun * sizeof(double));
-      vars = (double*)malloc(nrun * sizeof(double));
-      if (means == NULL || vars == NULL) zerror("oom means vars");
-      grand = 0;
-      for (irun = 0; irun < nrun; irun++) {
-         means[irun] = 0;
-         for (i = 0; i < nmin; i++)
-            means[irun] += run_data[irun][j*nr[irun] + i] / nmin;
-         grand += means[irun] / nrun;
-      }
-      W = B = 0;
-      for (irun = 0; irun < nrun; irun++) {
-         vars[irun] = 0;
-         if (nmin > 1) {
-            for (i = 0; i < nmin; i++)
-               vars[irun] += square(run_data[irun][j*nr[irun] + i] - means[irun]) / (nmin - 1);
-         }
-         W += vars[irun] / nrun;
-         B += square(means[irun] - grand) * nmin / (nrun - 1);
-      }
-      rhat = (nmin > 1 && W > 0 ? sqrt(((nmin - 1.0) / nmin * W + B / nmin) / W) : 99);
+      rank_chain = SplitRankNormalizeParam(run_data, nr, nrun, nmin, j, 0, &nchain, &nsplit);
+      rhat = RhatChainMatrix(rank_chain, nchain, nsplit, &W, &varplus[j]);
       Ws[j] = W;
-      varplus[j] = (nmin - 1.0) / nmin * W + B / nmin;
+      fold_chain = SplitRankNormalizeParam(run_data, nr, nrun, nmin, j, 1, &nchain, &nsplit);
+      folded_rhat = RhatChainMatrix(fold_chain, nchain, nsplit, NULL, NULL);
+      if (folded_rhat > rhat)
+         rhat = folded_rhat;
       rhats[j] = rhat;
-      if (rhat > *max_rhat) *max_rhat = rhat;
-      if (rhat > target_rhat)
-         *rhat_pass = 0;
-      free(means);
-      free(vars);
+      if (is_node[j]) {
+         node_rhats[inode_rhat++] = rhat;
+         if (rhat <= target_rhat)
+            node_rhat_pass++;
+      }
+      if (is_lnl[j]) {
+         lnl_rhat = rhat;
+         if (rhat > target_rhat)
+            lnl_rhat_pass = 0;
+      }
+      FreeChainMatrix(rank_chain, nchain);
+      FreeChainMatrix(fold_chain, nchain);
    }
+   if (nnode_check > 0) {
+      qsort(node_rhats, (size_t)nnode_check, sizeof(double), comparedouble);
+      *max_rhat = node_rhats[required_node_pass - 1];
+   }
+   if (has_lnl && lnl_rhat > *max_rhat)
+      *max_rhat = lnl_rhat;
+   if ((has_lnl && !lnl_rhat_pass) || node_rhat_pass < required_node_pass)
+      *rhat_pass = 0;
 
    if (!*rhat_pass) {
       *min_ess = -1;
@@ -2134,26 +2358,35 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
                chunk, samples_per_run, burnin_samples, check_name[j], rhats[j], rhats[j] <= target_rhat, 0);
       }
    }
-   else {
-      for (j = 0; j < ncheck; j++) {
-         ess = EffectiveSizeMultiChain(run_data, nr, nrun, nmin, j, Ws[j], varplus[j]);
-         if (ess < *min_ess) *min_ess = ess;
-         if (ess < target_ess)
-            *ess_pass = 0;
-         if (fparam)
-            fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t%.8g\t%d\t%d\n",
-               chunk, samples_per_run, burnin_samples, check_name[j], rhats[j], ess, rhats[j] <= target_rhat, ess >= target_ess);
-         if (ess < target_ess)
-            pass = 0;
-      }
-   }
+	   else {
+	      for (j = 0; j < ncheck; j++) {
+	         check_ess = (is_lnl[j] || (is_node[j] && rhats[j] <= target_rhat));
+	         rank_chain = SplitRankNormalizeParam(run_data, nr, nrun, nmin, j, 0, &nchain, &nsplit);
+	         ess = EffectiveSizeMultiChain(rank_chain, nchain, nsplit, Ws[j], varplus[j]);
+	         FreeChainMatrix(rank_chain, nchain);
+	         if (check_ess) {
+	            if (ess < *min_ess) *min_ess = ess;
+	            if (ess < target_ess)
+	               *ess_pass = 0;
+	         }
+	         if (fparam)
+	            fprintf(fparam, "%d\t%d\t%d\t%s\t%.8g\t%.8g\t%d\t%d\n",
+	               chunk, samples_per_run, burnin_samples, check_name[j], rhats[j], ess, rhats[j] <= target_rhat, ess >= target_ess);
+	         if (check_ess && ess < target_ess)
+	            pass = 0;
+	      }
+	   }
 
+cleanup:
    for (irun = 0; irun < nrun; irun++)
       free(run_data[irun]);
    free(run_data);
    free(nr);
    free(cols);
+   free(is_node);
+   free(is_lnl);
    free(rhats);
+   free(node_rhats);
    free(Ws);
    free(varplus);
    for (j = 0; j < p; j++)
@@ -2166,7 +2399,7 @@ int CheckConvergenceESS(int nrun, int burnin_samples, double target_rhat, double
 int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastgen, int *nskipped)
 {
    FILE *fin = (FILE*)fopen(filename, "r");
-   int lline = 10000000, n = 0, nline = 0, nf, has_header = 0, igen = 0, skipped = 0;
+   int lline = 10000000, n = 0, nline = 0, nf, has_header = 0, igen = 0, skipped = 0, partial_tail;
    char firstfield[64], *line;
 
    if (fin == NULL) zerror("mcmcfile open error");
@@ -2193,11 +2426,16 @@ int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastg
          zerror("mcmcfile has no header; refusing to append");
       if (sscanf(line, "%d", &igen) != 1)
          zerror("cannot read generation number in mcmcfile");
+      partial_tail = (strchr(line, '\n') == NULL);
       if (maxgen > 0 && igen > maxgen) {
          skipped++;
          continue;
       }
       if (nf != expected_fields) {
+         if (maxgen > 0 && (skipped > 0 || partial_tail)) {
+            skipped++;
+            continue;
+         }
          printf("\nLine %d in %s has %d fields, while this run expects %d.\n",
             nline, filename, nf, expected_fields);
          zerror("mcmcfile does not match the current analysis before checkpoint generation");
@@ -2216,10 +2454,59 @@ int CountMCMCSamples(char *filename, int expected_fields, int maxgen, int *lastg
    return(n);
 }
 
+int CountMCMCRecordsLoose(char *filename)
+{
+   FILE *fin = (FILE*)fopen(filename, "r");
+   int lline = 1000000, n = 0, nline = 0, nf;
+   char *line;
+
+   if (fin == NULL)
+      return(0);
+   if ((line = (char*)malloc(lline * sizeof(char))) == NULL)
+      zerror("oom line in CountMCMCRecordsLoose");
+
+   while (fgets(line, lline, fin)) {
+      nf = CountFields(line);
+      if (nf == 0) continue;
+      nline++;
+      if (nline == 1 && !FirstFieldIsNumber(line))
+         continue;
+      n++;
+   }
+   fclose(fin);
+   free(line);
+   return(n);
+}
+
+int MinCompletedAdaptiveSamples(int nrun, int chunk_size)
+{
+   char filename[256];
+   int irun, n, min_records = -1, completed_samples;
+
+   if (chunk_size <= 0)
+      return(0);
+   for (irun = 1; irun <= nrun; irun++) {
+      sprintf(filename, "run%d/%s", irun, com.checkpointf);
+      if (!FileExists(filename))
+         return(0);
+      sprintf(filename, "run%d/%s", irun, com.mcmcf);
+      n = CountMCMCRecordsLoose(filename);
+      if (n <= 0)
+         return(0);
+      if (min_records < 0 || n < min_records)
+         min_records = n;
+   }
+   completed_samples = min_records - (mcmc.sampfreq > 1);
+   if (completed_samples < 0)
+      completed_samples = 0;
+   completed_samples = completed_samples / chunk_size * chunk_size;
+   return(completed_samples);
+}
+
 int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, int *lastgen)
 {
    FILE *fin, *fout;
-   int lline = 10000000, n = 0, nline = 0, nf, has_header = 0, igen = 0, skipped = 0;
+   int lline = 10000000, n = 0, nline = 0, nf, has_header = 0, igen = 0, skipped = 0, partial_tail;
    char firstfield[64], tmpfile[4096], bakfile[4096], *line;
 
    snprintf(tmpfile, sizeof(tmpfile), "%s.tmp", filename);
@@ -2250,12 +2537,18 @@ int TrimMCMCFileToGeneration(char *filename, int expected_fields, int maxgen, in
          zerror("mcmcfile has no header; refusing to trim");
       if (sscanf(line, "%d", &igen) != 1)
          zerror("cannot read generation number in mcmcfile");
+      partial_tail = (strchr(line, '\n') == NULL);
       if (igen > maxgen) {
          skipped++;
          continue;
       }
-      if (nf != expected_fields)
+      if (nf != expected_fields) {
+         if (skipped > 0 || partial_tail) {
+            skipped++;
+            continue;
+         }
          zerror("mcmcfile does not match the current analysis before checkpoint generation");
+      }
       {
          fputs(line, fout);
          n++;
@@ -3019,14 +3312,14 @@ int GenerateBlengthGH(char infile[])
 int GetOptions(char *ctlf)
 {
    int  transform0 = ARCSIN_B; /* default transform: SQRT_B, LOG_B, ARCSIN_B */
-   int  iopt, i, j, nopt = 36, lline = 4096;
+   int  iopt, i, j, nopt = 37, lline = 4096;
    char line[4096], *pline, opt[33], *comment = "*#", ch;
    char *optstr[] = { "seed", "seqfile","treefile", "outfile", "mcmcfile", "checkpoint", "BayesFactorBeta",
         "seqtype", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
         "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
         "print", "burnin", "sampfreq", "nsample", "finetune", "n_runs",
-        "chunk_size", "target_rhat", "target_ess", "mode" };
+        "chunk_size", "target_rhat", "target_ess", "mode", "target_node_fraction" };
    double t = 1, *eps = mcmc.steplength;
    FILE  *fctl = zfopen(ctlf, "r");
 
@@ -3039,6 +3332,7 @@ int GetOptions(char *ctlf)
    mcmc.chunkSize = 1000;
    mcmc.targetRhat = 1.01;
    mcmc.targetESS = 200;
+   mcmc.targetNodeFraction = 1.0;
    com.checkpointp = 0.1;
    strcpy(com.checkpointf, "mcmctree.ckpt");
    if (fctl) {
@@ -3188,6 +3482,7 @@ int GetOptions(char *ctlf)
                         zerror("mode should be classic or dynamic");
                   }
                   break;
+               case (36): mcmc.targetNodeFraction = t;  break;
                }
                break;
             }
@@ -3220,6 +3515,8 @@ int GetOptions(char *ctlf)
          zerror("chunk_size, nsample, and target_ess should be positive in dynamic mode");
       if (mcmc.targetRhat <= 1)
          zerror("target_rhat should be > 1");
+      if (mcmc.targetNodeFraction <= 0 || mcmc.targetNodeFraction > 1)
+         zerror("target_node_fraction should be in (0,1]");
    }
    if (mcmc.usedata == 2) {
       com.model = 0;  com.fix_kappa = com.fix_alpha = 1; com.alpha = 0;
