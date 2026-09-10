@@ -60,7 +60,8 @@ int WriteUsedata2ControlFile(char oldctl[], char newctl[], char inBVf[]);
 int ReadTreeSeqs(FILE*fout);
 int ProcessNodeAnnotation(int* haslabel);
 int ReadBlengthGH(char infile[]);
-int GenerateBlengthGH(char infile[]);
+int GenerateBlengthGHParallel(char infile[]);
+int GenerateBlengthGHLegacy(char infile[]);
 int GenerateBlengthGHLocusFiles(int locus, char workdir[]);
 int RunBlengthGHJobs(char workdirs[][64], int njob);
 int GetMem(void);
@@ -927,7 +928,7 @@ int main(int argc, char *argv[])
          if (com.seqtype == 2 && com.model == 2 && com.daafile[0] == '\0')
             zerror("for seqtype = 2 and usedata = 4, use model = LG, WAG, JTT, etc., or model = path/to/model.dat");
          printf("\nusedata = 4: generating approximate likelihood in %s and continuing with MCMC.\n", com.inBVf);
-         GenerateBlengthGH(com.inBVf);
+         GenerateBlengthGHParallel(com.inBVf);
          fclose(fout);
       }
       MakeAbsolutePath(com.inBVf, cwd);
@@ -976,7 +977,7 @@ int main(int argc, char *argv[])
       if (com.model == JC69 || com.model == F81) { com.fix_kappa = 1; com.kappa = 1; }
    }
    else if (mcmc.usedata == 3) {
-      GenerateBlengthGH("out.BV");  /* this is used so that in.BV is not overwritten */
+      GenerateBlengthGHLegacy("out.BV");  /* this is used so that in.BV is not overwritten */
       exit(0);
    }
 
@@ -3279,7 +3280,73 @@ int RunBlengthGHJobs(char workdirs[][64], int njob)
 }
 
 
-int GenerateBlengthGH(char infile[])
+int GenerateBlengthGHLegacy(char infile[])
+{
+   /* Legacy usedata=3 path: generate tmpXXXX files, run baseml/codeml, and
+      collect rst2 in the current directory, matching original MCMCtree. */
+   FILE *fseq, *ftree, *fctl;
+   FILE *fBGH = zfopen(infile, "w");
+   char tmpseqf[32], tmptreef[32], ctlf[32], outf[32], line[10000];
+   int i, locus;
+
+   mcmc.usedata = 1;
+   for (locus = 0; locus < data.ngene; locus++) {
+      printf("\n\n*** Locus %d ***\n", locus + 1);
+      sprintf(tmpseqf, "tmp%04d.txt", locus + 1);
+      sprintf(tmptreef, "tmp%04d.trees", locus + 1);
+      sprintf(ctlf, "tmp%04d.ctl", locus + 1);
+      sprintf(outf, "tmp%04d.out", locus + 1);
+      fseq = zfopen(tmpseqf, "w");
+      ftree = zfopen(tmptreef, "w");
+      fctl = zfopen(ctlf, "w");
+
+      UseLocus(locus, 0, 0, 1);
+      com.cleandata = data.cleandata[locus];
+      for (i = 0; i < com.ns; i++)
+         com.z[i] = data.z[locus][i];
+      com.npatt = com.posG[1] = data.npatt[locus];
+      com.posG[0] = 0;
+      com.fpatt = data.fpatt[locus];
+
+      DeRoot();
+
+      printPatterns(fseq);
+      fprintf(ftree, "  1\n\n");
+      OutTreeN(ftree, 1, 0);
+      fprintf(ftree, "\n\n");
+
+      fprintf(fctl, "seqfile = %s\n", tmpseqf);
+      fprintf(fctl, "treefile = %s\n", tmptreef);
+      fprintf(fctl, "outfile = %s\nnoisy = 3\n", outf);
+      if (com.seqtype)
+         fprintf(fctl, "seqtype = %d\n", com.seqtype);
+      fprintf(fctl, "model = %d\n", com.model);
+      if (com.seqtype == 1) {
+         fprintf(fctl, "icode = %d\n", com.icode);
+         fprintf(fctl, "fix_kappa = 0\n kappa = 2\n");
+      }
+      if (com.seqtype == 2)
+         fprintf(fctl, "aaRatefile = %s\n", com.daafile);
+      if (com.alpha)
+         fprintf(fctl, "fix_alpha = 0\nalpha = 0.5\nncatG = %d\n", com.ncatG);
+      fprintf(fctl, "Small_Diff = 0.1e-6\ngetSE = 2\n");
+      fprintf(fctl, "method = %d\n", (com.alpha == 0 || com.ns > 100 ? 1 : 0));
+
+      fclose(fseq);  fclose(ftree);  fclose(fctl);
+
+      if (com.seqtype) sprintf(line, "codeml %s", ctlf);
+      else            sprintf(line, "baseml %s", ctlf);
+      printf("running %s\n", line);
+      system(line);
+
+      appendfile(fBGH, "rst2");
+   }
+   fclose(fBGH);
+   return(0);
+}
+
+
+int GenerateBlengthGHParallel(char infile[])
 {
    /* This generates the sequence alignment and tree files for calculating branch
       lengths, gradient, and hessian.
