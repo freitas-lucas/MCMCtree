@@ -1,5 +1,12 @@
 vc/
 *~
+.DS_Store
+
+# PAML binaries kept in this MCMCtree-focused fork
+/src/baseml
+/src/codeml
+/src/mcmctree
+/src/infinitesites
 
 
 # Prerequisites
