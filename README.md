@@ -1,62 +1,402 @@
-# MCMCtree-focused PAML fork
+# MCMCtree
+This repository is a focused fork of PAML for working with `mcmctree`. It keeps the source files and data needed to compile and run `mcmctree`, plus  `baseml` and `codeml` helpers used by MCMCtree's approximate likelihood workflow.
 
-This repository is a focused fork of PAML for working with `mcmctree`.
-It keeps the source files and data needed to compile and run `mcmctree`,
-plus the `baseml` and `codeml` helpers used by MCMCtree's approximate
-likelihood workflow.
-
-The full PAML package is maintained by Ziheng Yang and is available from
-the upstream PAML project. This fork preserves the original GPL v3 license
-and source lineage while trimming programs and examples that are unrelated
-to MCMCtree workflows.
+The full PAML package is maintained by Ziheng Yang and is available from [here](https://github.com/abacus-gene/paml). This fork preserves the original GPL v3 license and source lineage while trimming programs and examples that are unrelated to MCMCtree workflows.
 
 ## Included programs
-
 - `mcmctree`
 - `infinitesites`
 - `baseml`
 - `codeml`
 
-`baseml` and `codeml` are retained because MCMCtree can call them to
-generate branch lengths, gradients, and Hessian matrices for approximate
-likelihood analyses.
+`baseml` and `codeml` are retained because MCMCtree can call them to generate branch lengths, gradients, and Hessian matrices for approximate likelihood analyses.
 
-## Building
+## New parameters
+- `n_runs` specifies the number of independent MCMC chains to perform.
+- `mode` specifies whether MCMCtree should run using the original fixed-length mode, `mode = classic`, or the new adaptive mode, `mode = dynamic`.
+- `chunk_size` specifies how many samples are collected between adaptive checks.
+- `target_rhat` specifies the maximum threshold for `R̂`. The default is `target_rhat = 1.01`.
+- `target_ess` specifies the minimum threshold for rank-normalized ESS. The default is `target_ess = 200`.
+- `target_node_fraction` specifies the minimum fraction of node ages required to pass adaptive checks. The default is `target_node_fraction = 1.0`, meaning all nodes.
 
-From the repository root:
+## Old parameters with new options
+- `checkpoint` now accepts `checkpoint = 3`, which enables automatic resume from an existing checkpoint file.
+- `usedata` now accepts `usedata = 4`, which provides a single-step approximate-likelihood workflow.
+- `model` now accepts amino-acid substitution models directly, for example `model = LG`, `model = WAG`, or `model = JTT`. It can also accept a path to a custom amino-acid rate matrix file.
 
-```sh
-make -C src
+## Details of each new parameter
+
+### `n_runs`
+`n_runs` specifies the number of independent MCMC chains to run.
+
+For example:
+```text
+n_runs = 4
 ```
 
-This builds:
+creates four independent run directories:
+```text
+run1/
+run2/
+run3/
+run4/
+```
+
+Each run has its own output files, including `SeedUsed`, `out.txt`, `mcmc.txt`, `FigTree.tre`, and checkpoint file. If `n_runs` is not specified, the default is:
 
 ```text
-src/mcmctree
-src/infinitesites
-src/baseml
-src/codeml
+n_runs = 1
 ```
 
-To remove build products:
+When `n_runs > 1`, MCMCtree runs the chains in parallel, allowing independent chains to be run using multiple CPU cores.
 
-```sh
-make -C src clean
+### `mode`
+`mode` specifies whether MCMCtree should run in the original fixed-length mode or in the new adaptive mode.
+
+The default is:
+
+```text
+mode = classic
 ```
 
-## Main directories
+In classic mode, MCMCtree follows the original behavior:
 
-- `src/`: C source code and build rules for the retained programs.
-- `dat/`: amino-acid rate matrix files used by protein analyses.
-- `examples/`: MCMCtree-focused example datasets and control files.
-- `doc/`: MCMCtree tutorial documentation.
+```text
+mode = classic
+burnin = 50000
+sampfreq = 10
+nsample = 20000
+```
+
+Here, `burnin` is the number of burn-in iterations, `sampfreq` is the sampling frequency, and `nsample` is the number of MCMC samples collected after burn-in.
+
+To use adaptive MCMC, set:
+
+```text
+mode = dynamic
+```
+
+In dynamic mode, MCMCtree runs independent chains in chunks and checks convergence and ESS after each chunk.
+
+### `chunk_size`
+`chunk_size` is used only when:
+
+```text
+mode = dynamic
+```
+
+It specifies how many samples are collected by each chain before MCMCtree checks convergence and ESS.
+
+For example:
+
+```text
+chunk_size = 1000
+```
+
+means that each chain collects 1000 samples, then MCMCtree calculates diagnostics. If the stopping criteria are not met, each chain collects another 1000 samples, and the process continues until the adaptive criteria are met or `nsample` is reached.
+
+### `target_rhat
+`target_rhat` is used only when:
+
+```text
+mode = dynamic
+```
+
+It specifies the maximum allowed `R̂` value for the monitored parameters. The default is:
+
+```text
+target_rhat = 1.01
+```
+
+Dynamic mode monitors:
+
+- node ages, `t_n*`
+- likelihood, `lnL`
+
+The `lnL` parameter must always pass the `R̂` threshold. For node ages, the required fraction of nodes is controlled by `target_node_fraction`.
+
+### `target_ess`
+`target_ess` is used only when:
+
+```text
+mode = dynamic
+```
+
+It specifies the minimum required rank-normalized effective sample size. The default is:
+
+```text
+target_ess = 200
+```
+
+ESS is used for the stopping decision only for `lnL` and for the node ages that pass the `R̂` threshold. ESS values are still reported for all monitored parameters in `adaptive_stats_by_parameter.txt`.
+
+### `target_node_fraction`
+`target_node_fraction` is used only when:
+
+```text
+mode = dynamic
+```
+
+It specifies the fraction of node ages that must pass the `R̂` threshold. The default is:
+
+```text
+target_node_fraction = 1.0
+```
+
+This means that all node ages must pass the `R̂` threshold. For example:
+
+```text
+target_node_fraction = 0.5
+```
+
+means that at least 50% of node ages must pass the `R̂` threshold.
+
+The `lnL` parameter is always required to pass, independently of `target_node_fraction`.
+
+### Dynamic-mode stopping rule
+In dynamic mode, MCMCtree stops only after the convergence and ESS criteria pass for three consecutive checks.
+
+A typical dynamic configuration is:
+
+```text
+mode = dynamic
+burnin = 0.25
+sampfreq = 10
+nsample = 20000
+n_runs = 4
+
+chunk_size = 1000
+target_rhat = 1.01
+target_ess = 200
+target_node_fraction = 1.0
+```
+
+In dynamic mode:
+
+- `burnin` is a fraction in `[0,1)`.
+- `nsample` is the maximum number of samples per chain.
+- `chunk_size` is the number of samples collected per chain between checks.
+- `sampfreq` keeps its original meaning as the sampling frequency in MCMC iterations.
+
+For example, with:
+
+```text
+burnin = 0.25
+sampfreq = 10
+nsample = 20000
+chunk_size = 1000
+```
+
+MCMCtree can collect up to 20000 samples per chain, sampling every 10 MCMC iterations, and it will discard the first 25% of samples from each chain when calculating diagnostics and summaries.
+
+### Dynamic-mode output files
+When using dynamic mode with multiple runs, MCMCtree keeps the individual outputs for each run and also writes combined results.
+
+Individual run directories contain files such as:
+
+```text
+run1/out.txt
+run1/mcmc.txt
+run1/FigTree.tre
+run1/SeedUsed
+run1/mcmctree.ckpt1
+```
+
+The combined output files are:
+
+```text
+combined_mcmc.txt
+combined_out.txt
+combined_FigTree.tre
+```
+
+The combined files are the main summary of the independent runs after removing the dynamic-mode burn-in fraction. Dynamic diagnostics are written to:
+
+```text
+adaptive_stats.txt
+adaptive_stats_by_parameter.txt
+```
+
+`adaptive_stats.txt` gives one summary line per adaptive check. `adaptive_stats_by_parameter.txt` gives `R̂` and ESS values for each monitored parameter at each check.
+
+### `checkpoint = 3`
+`checkpoint = 3` enables automatic resume from an existing checkpoint file.
+
+If the checkpoint file is found, MCMCtree restores the chain state, keeps the existing `mcmc.txt`, and appends only the remaining samples needed to reach `nsample`. For example, if:
+
+```text
+nsample = 20000
+```
+
+and the existing `mcmc.txt` already contains 15000 samples, MCMCtree will collect 5000 additional samples after resuming from the checkpoint.
+
+This avoids manually changing `checkpoint = 1` to `checkpoint = 2` and renaming the previous MCMC output file.
+
+### `usedata = 4`
+`usedata = 4` provides a single-step approximate-likelihood workflow.
+
+In the original approximate-likelihood workflow, users typically had to:
+
+1. Run MCMCtree to generate temporary control files.
+2. Run `baseml` or `codeml` separately to estimate branch lengths, gradients, and Hessian matrices.
+3. Rename or combine the resulting files into `in.BV`.
+4. Run MCMCtree again with `usedata = 2`.
+
+With `usedata = 4`, MCMCtree can generate the approximate-likelihood file and then continue directly to the MCMC analysis.
+
+For DNA data, `usedata = 4` generates the approximate-likelihood file using the selected nucleotide model and then continues with the approximate-likelihood MCMC.
+
+For protein data, amino-acid models can be specified directly with `model`.
+
+### `model` for amino-acid data
+For protein data, amino-acid substitution models can be specified directly with `model`.
+
+For example:
+
+```text
+seqtype = 2
+usedata = 4
+model = LG
+```
+
+Other amino-acid models can be used similarly:
+
+```text
+model = WAG
+model = JTT
+```
+
+A custom amino-acid rate matrix file can also be provided:
+
+```text
+model = path/to/model.dat
+```
+
+This avoids manually editing temporary `codeml` control files only to change the amino-acid substitution model.
+
+### Approximate likelihood without a dummy alignment
+For `usedata = 2`, MCMCtree can use an existing approximate-likelihood file without requiring a dummy alignment.
+
+This makes the final approximate-likelihood MCMC step cleaner when `in.BV` has already been generated.
+
+### References for new diagnostics
+The convergence and ESS diagnostics implemented in dynamic mode follow:
+
+Vehtari A, Gelman A, Simpson D, Carpenter B, Bürkner P-C. 2021. Rank-normalization, folding, and localization: an improved Rhat for assessing convergence of MCMC. *Bayesian Analysis* 16:667-718.
+
 
 ## Notes
+This fork is intentionally not a full PAML distribution. Programs such as `yn00`, `evolver`, `pamp`, `chi2`, and `ds` have been removed from this focused repository.
 
-This fork is intentionally not a full PAML distribution. Programs such as
-`yn00`, `evolver`, `pamp`, `chi2`, and `ds` have been removed from this
-focused repository.
+The section below preserves the original PAML README. Please refer to it for general PAML information, including installation, documentation, input formatting, citation guidelines, and links to the official PAML Wiki.
 
-If you use this software, cite the appropriate PAML and MCMCtree papers,
-including the original PAML references and the approximate-likelihood
-MCMCtree references where relevant.
+---
+
+# Original PAML README=
+
+# Phylogenetic Analysis by Maximum Likelihood
+
+**PAML** (for **Phylogenetic Analysis by Maximum Likelihood**) is a package of programs for phylogenetic analyses of DNA or protein sequences using maximum likelihood. It is maintained by [**Ziheng Yang**](http://abacus.gene.ucl.ac.uk/) and distributed under the GNU GPL v3.
+
+Before running any of the programs included in the `PAML` software, please go through the different sections of this Wiki, where a detailed explanation of how to install and run the programs is given. One of the main problems users face is related to **data formatting**. In that way, please make sure that you go through the **section [`Data formatting` in the PAML Wiki](https://github.com/abacus-gene/paml/wiki/Data-formatting)** before running any `PAML` program and format your input data files and control files accordingly.
+
+> [!IMPORTANT]
+>
+> * Problems with input data, control files, error/warning messages output by the `PAML` programs (which inform users about formatting issues in their input files or wrong settings in their control files), and general questions should be posted in the **[`PAML` discussion group](https://groups.google.com/g/pamlsoftware?pli=1)**. **Before posting a message, please [use the search tool in the `PAML` discussion group](https://groups.google.com/g/pamlsoftware) to check whether your question/s have already been asked by other `PAML` users. You should also refer to [the FAQs document](https://github.com/abacus-gene/paml/blob/master/doc/pamlFAQs.pdf)**. If you still cannot find an answer to your question/s, please post them in the [**`PAML` discussion group**](https://groups.google.com/g/pamlsoftware).
+> * Please, **do not** paste the screen output and the error/warning that you get without any reference when you are requesting help. Instead, make sure that you attach the input data and the control files you are using, explain how you ran `PAML`, which `PAML` version you are using, etc. In that way, your issue will be **much easier and faster to troubleshoot**. You can find more information about **how to report your warning/error message [on this website](https://uxwritinghub.com/error-message-examples/)**.
+> * **Please, only raise an issue on this GitHub repository when you experience technical problems such as compiling issues, programs aborting or not running at all, etc.**
+
+## Installation
+
+ANSI C source codes and executable files are distributed for UNIX, Linux, and Mac OS X (see the [latest stable release available on this GitHub repository](https://github.com/abacus-gene/paml/releases)). `PAML` is not good for tree making, although it may be used to estimate parameters and test hypotheses to study the evolutionary process once you have reconstructed trees using other programs such as [`RAxML-NG`](https://github.com/amkozlov/raxml-ng), [`IQ-TREE`](http://www.iqtree.org/), [`PAUP*`](https://paup.phylosolutions.com/), [`PHYLIP`](https://evolution.genetics.washington.edu/phylip/doc/main.html), [`PhyML`](http://www.atgc-montpellier.fr/phyml/), etc.
+
+To download and install `PAML` software, please follow the next links in the wiki:
+
+* [Downloading and installing `PAML`](https://github.com/abacus-gene/paml/wiki/Installation)
+  * [`PAML` for Linux](https://github.com/abacus-gene/paml/wiki/Installation#paml-for-linux)
+    * [How to export paths in Linux](https://github.com/abacus-gene/paml/wiki/Installation#exporting-paths-linux)
+  * [`PAML` for Mac OS X](https://github.com/abacus-gene/paml/wiki/Installation#paml-for-mac-os-x)
+    * [How to export paths in Mac OS X](https://github.com/abacus-gene/paml/wiki/Installation#exporting-paths-mac-os-x)
+  * [`PAML` for Windows 10 or later](https://github.com/abacus-gene/paml/wiki/Installation#paml-for-windows-10-or-later)
+    * [How to export paths using the Windows Subsystem for Linux](https://github.com/abacus-gene/paml/wiki/Installation#exporting-paths-wsl)
+  * [Old compiled versions of `PAML`](https://github.com/abacus-gene/paml/wiki/Installation#old-compiled-versions-of-paml)
+    * [`PAML` for Mac OS X](https://github.com/abacus-gene/paml/wiki/Installation#old-paml-versions-for-mac-os-x)
+    * [`PAML` for Windows 9x/NT/2000/XP/Vista 7](https://github.com/abacus-gene/paml/wiki/Installation#old-paml-versions-for-windows-9xnt2000xpvista-7)
+  * [Graphical user interface: PAML-X](https://github.com/abacus-gene/paml/wiki/Installation#graphical-user-interface-paml-x)
+
+## Documentation
+
+The [PAML Wiki](https://github.com/abacus-gene/paml/wiki/) is still under construction :wrench: -- we are slowly migrating the [PAML documentation in PDF format](https://github.com/abacus-gene/paml/blob/master/doc/pamlDOC.pdf) to a more interactive and engaging tutorial!
+
+In the meantime, you can access the following sections, which are also detailed in the PAML Wiki home section:
+
+* [Overview](https://github.com/abacus-gene/paml/wiki/Overview)
+  * [`PAML` documentation](https://github.com/abacus-gene/paml/wiki/Overview#paml-documentation)
+  * [What `PAML` programs can do](https://github.com/abacus-gene/paml/wiki/Overview#what-paml-programs-can-do)
+  * [What `PAML` programs cannot do](https://github.com/abacus-gene/paml/wiki/Overview#what-paml-programs-cannot-do)
+* [Data formatting](https://github.com/abacus-gene/paml/wiki/Data-formatting)
+  * [Sequence data file format](https://github.com/abacus-gene/paml/wiki/Data-formatting#sequence-data-file-format)
+    * [Sequential and interleaved formats](https://github.com/abacus-gene/paml/wiki/Data-formatting#sequential-and-interleaved-formats)
+      * [Species/sequence names](https://github.com/abacus-gene/paml/wiki/Data-formatting#speciessequence-names)
+      * [Option `G`](https://github.com/abacus-gene/paml/wiki/Data-formatting#option-g)
+      * [Option `G` for codon sequences (`codeml` with `seqtype = 1`)](https://github.com/abacus-gene/paml/wiki/Data-formatting#option-g-for-codon-sequences-codeml-with-seqtype--1)
+    * [Site pattern counts](https://github.com/abacus-gene/paml/wiki/Data-formatting#site-pattern-counts)
+  * [Tree file format and representations of tree topology](https://github.com/abacus-gene/paml/wiki/Data-formatting#tree-file-format-and-representations-of-tree-topology)
+    * [Parenthesis notation](https://github.com/abacus-gene/paml/wiki/Data-formatting#parenthesis-notation)
+    * [Tree files produced by `PAUP` and `MacClade`](https://github.com/abacus-gene/paml/wiki/Data-formatting#tree-files-produced-by-paup-and-macclade)
+    * [Branch or node labels](https://github.com/abacus-gene/paml/wiki/Data-formatting#branch-or-node-labels)
+    * [Divergence date symbol `@`](https://github.com/abacus-gene/paml/wiki/Data-formatting#divergence-date-symbol-)
+    * [Branch representation of tree topology](https://github.com/abacus-gene/paml/wiki/Data-formatting#branch-representation-of-tree-topology)
+* [Substitution models](https://github.com/abacus-gene/paml/wiki/Substitution-models)
+  * [Nucleotide substitution models](https://github.com/abacus-gene/paml/wiki/Substitution-models#nucleotide-substitution-models)
+  * [Codon substitution models](https://github.com/abacus-gene/paml/wiki/Substitution-models#codon-substitution-models)
+    * [Branch models](https://github.com/abacus-gene/paml/wiki/Substitution-models#branch-models)
+    * [Site models](https://github.com/abacus-gene/paml/wiki/Substitution-models#site-models)
+      * [Suzuki and Gojobori’s (1999) method for detecting sites under positive selection](https://github.com/abacus-gene/paml/wiki/Substitution-models#suzuki-and-gojoboris-1999-method-for-detecting-sites-under-positive-selection)
+    * [Branch-site models](https://github.com/abacus-gene/paml/wiki/Substitution-models#branch-site-models)
+    * [Clade models](https://github.com/abacus-gene/paml/wiki/Substitution-models#clade-models)
+    * [Mutation-selection models](https://github.com/abacus-gene/paml/wiki/Substitution-models#mutation-selection-model)
+  * [Amino acid substitution models](https://github.com/abacus-gene/paml/wiki/Substitution-models#amino-acid-substitution-models)
+* **`PAML` programs**
+  * [BASEML](https://github.com/abacus-gene/paml/wiki/BASEML)
+  * [BASEMLG](https://github.com/abacus-gene/paml/wiki/BASEMLG)
+  * [CODEML](https://github.com/abacus-gene/paml/wiki/CODEML)
+  * [Evolver](https://github.com/abacus-gene/paml/wiki/Evolver)
+  * [Infinitesites](https://github.com/abacus-gene/paml/wiki/Infinitesites)
+  * [MCMCtree](https://github.com/abacus-gene/paml/wiki/MCMCtree)
+  * [yn00](https://github.com/abacus-gene/paml/wiki/yn00)
+
+## Citing `PAML`
+
+**If you use `PAML`**, please cite the following:
+
+* [Yang, Z (1997). PAML: a program package for phylogenetic analysis by maximum likelihood. *Comput. Appl. Biosci.* 13, 555-556](http://abacus.gene.ucl.ac.uk/ziheng/pdf/1997YangCABIOSv13p555.pdf).
+* [Yang, Z (2007). PAML 4: Phylogenetic Analysis by Maximum Likelihood. *Mol. Biol. Evol.* 24, 1586-1591](https://academic.oup.com/mbe/article-pdf/24/8/1586/3853532/msm088.pdf).
+
+### In addition...
+
+**If you use the `PAML` program `MCMCtree`**, please cite the following papers if you have used/run...
+
+* ... the **approximate likelihood calculation** to speed up analyses with phylogenomic datasets (calculating branch lengths, Hessian, and gradient):
+  * [dos Reis M and Yang Z (2011). Approximate likelihood calculation for Bayesian estimation of divergence times. *Mol. Biol. Evol.* 28, 2161-2172](http://abacus.gene.ucl.ac.uk/ziheng/pdf/2011dosReisYangMBEv28p2161.pdf).
+* ... **Bayesian model selection** analyses:
+  * [dos Reis M, et al. (2018). Using phylogenomic data to explore the effects of relaxed clocks and calibration strategies on divergence time estimation: Primates as a test case. *Syst. Biol.* 67, 594–615](http://abacus.gene.ucl.ac.uk/ziheng/pdf/2018dosReis.Primates.pdf). Also, please cite the [`mcmc3r` R package](https://github.com/dosreislab/mcmc3r) if you use it ([see tutorial via this link](https://dosreislab.github.io/2017/10/24/marginal-likelihood-mcmc3r.html)).
+* ... the models for **continuous morphological characters** implemented in `MCMCtree`:
+  * [Álvarez-Carretero S, et al. (2019). Bayesian estimation of species divergence times using correlated quantitative characters. *Syst. Biol.* 68, 967–986](http://abacus.gene.ucl.ac.uk/ziheng/pdf/2019Alvarez-CarreteroSB.pdf). Also, please cite the [`mcmc3r` R package](https://github.com/dosreislab/mcmc3r) if you use it ([see tutorial via this link](https://github.com/dosreislab/mcmc3r/blob/master/vignettes/Reproduce_Carnivora_analysis.Rmd)).
+* ... the protocol **Bayesian Molecular Clock Dating Using Genome-Scale Datasets**:
+  * [dos Reis M and Yang, Z (2019). Bayesian Molecular Clock Dating Using Genome-Scale Datasets. *In*: Anisimova, M. (eds) Evolutionary Genomics. Methods in Molecular Biology, vol 1910. Humana, New York, NY](https://link.springer.com/protocol/10.1007/978-1-4939-9074-0_10). You can also [access this chapter and the code used throughout the protocol on the `divtime` GitHub repository maintained by Mario dos Reis](https://github.com/mariodosreis/divtime).
+* ... the protocol **Environmental Microbial Evolution: Methods and Protocols**:
+  * [dos Reis M (2022) *In*: Haiwei Luo (ed.) Environmental Microbial Evolution: Methods and Protocols. Methods in Molecular Biology, vol 2569. Humana, New York, NY](https://link.springer.com/protocol/10.1007/978-1-0716-2691-7_1). You can [access the code used throughout the protocol on the `microdiv` GitHub repository maintained by Mario dos Reis](https://github.com/dosreislab/microdiv).
+* ... the **Bayesian sequential-subtree (BSS) approach** and/or the scripts to **fit skew-*t* distributions to fossil calibrations**:
+  * [Álvarez-Carretero S, et al. (2022) A species-level timeline of mammal evolution integrating phylogenomic data. *Nature* 602, 263–267](https://rdcu.be/cDHW7). You can find [the tutorial to reproduce these analyses on the `mammals_dating` GitHub repository maintained by Sandra Álvarez-Carretero](https://github.com/sabifo4/mammals_dating).
+
+**If you use the `PAML` program `CODEML`**, please cite the following papers if you have used/run...
+
+* ... the protocol **A Beginners guide to estimating the non-synonymous to synonymous rate ratio of all protein-coding genes in a genome**:
+  * [Jeffares DC, Tomiczek B, Sojo V, dos Reis M (2015). A Beginners Guide to Estimating the Non-synonymous to Synonymous Rate Ratio of all Protein-Coding Genes in a Genome. *In*: Peacock, C. (eds) Parasite Genomics Protocols. Methods in Molecular Biology, vol 1201. Humana Press, New York, NY.](https://link.springer.com/protocol/10.1007/978-1-4939-1438-8_4).
+* ... the protocol **Beginner's guide on the use of PAML to detect positive selection** and/or the [corresponding GitHub tutorial on the `positive-selection` repository](https://github.com/abacus-gene/paml-tutorial/tree/main/positive-selection):
+  * [Álvarez-Carretero S, Kapli P, Yang Z (2023). Beginner's guide on the use of PAML to detect positive selection, Mol Biol Evol, 40(4):msad041.](https://doi.org/10.1093/molbev/msad041). Remember to read the [supplementary material where we discuss (i) analyses and checks you should carry out before running tests of positive selection with CODEML, (ii) gene tree VS species tree, and (iii) the usage of rooted and unrooted trees](http://abacus.gene.ucl.ac.uk/ziheng/pdf/2023Alvarez-Carretero-codeml-SI.pdf).
+
+## Additional information
+
+Changes in all version from PAML v4.10.0 have been documented for each release in [the `releases` section of this GitHub repository](https://github.com/abacus-gene/paml/releases). Changes and bug fixes prior to v4.10.0 can only be found in [doc/pamlHistory.txt](https://github.com/abacus-gene/paml/blob/master/doc/pamlHistory.txt).
