@@ -292,7 +292,7 @@ The section below preserves the original PAML README. Please refer to it for gen
 
 ---
 
-# Original PAML README=
+# Original PAML README
 
 # Phylogenetic Analysis by Maximum Likelihood
 
