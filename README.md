@@ -1,7 +1,9 @@
 # MCMCtree
-This repository is a focused fork of PAML for working with `mcmctree`. It keeps the source files and data needed to compile and run `mcmctree`, plus  `baseml` and `codeml` helpers used by MCMCtree's approximate likelihood workflow.
+This repository is a focused fork of PAML for working with `mcmctree`. Here we introduce a novel, integrated version of MCMCtree with an adaptive convergence-checking scheme designed to improve both computational efficiency and ease of use. Additionally it also reduces analysis runtimes involving datasets meeting user-defined convergence thresholds.
 
-The full PAML package is maintained by Ziheng Yang and is available [here](https://github.com/abacus-gene/paml). This fork preserves the original GPL v3 license and source lineage while trimming programs and examples that are unrelated to MCMCtree workflows.
+We kept only the source files and data needed to compile and run `mcmctree`, plus  `baseml` and `codeml` helpers used by MCMCtree's approximate likelihood workflow.
+
+The full PAML package, maintained by Ziheng Yang, is available [here](https://github.com/abacus-gene/paml). This fork preserves the original GPL v3 license and source lineage while trimming programs and examples that are unrelated to MCMCtree workflows.
 
 ## Included programs
 - `mcmctree`
