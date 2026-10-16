@@ -1,7 +1,5 @@
 # MCMCtree
-This repository is a focused fork of PAML for working with `mcmctree`. Here we introduce a novel, integrated version of MCMCtree with an adaptive convergence-checking scheme designed to improve both computational efficiency and ease of use. Additionally it also reduces analysis runtimes involving datasets meeting user-defined convergence thresholds.
-
-We kept only the source files and data needed to compile and run `mcmctree`, plus  `baseml` and `codeml` helpers used by MCMCtree's approximate likelihood workflow.
+This repository is a focused fork of PAML for working with `mcmctree`. Here we introduce a novel, integrated version of MCMCtree with an adaptive convergence-checking scheme designed to improve both computational efficiency and ease of use. We kept only the source files and data needed to compile and run `mcmctree`, plus  `baseml` and `codeml` helpers used by MCMCtree's approximate likelihood workflow.
 
 The full PAML package, maintained by Ziheng Yang, is available [here](https://github.com/abacus-gene/paml). This fork preserves the original GPL v3 license and source lineage while trimming programs and examples that are unrelated to MCMCtree workflows.
 
@@ -13,12 +11,54 @@ The full PAML package, maintained by Ziheng Yang, is available [here](https://gi
 
 `baseml` and `codeml` are retained because MCMCtree can call them to generate branch lengths, gradients, and Hessian matrices for approximate likelihood analyses.
 
+## TL;DR
+To run this new version of MCMCtree you should edit and add new parameters in the control file. Here's an example of the new control file using amino acid data:
+```
+          seed = -1
+       seqfile = sequences.phy
+      treefile = calibrated_tree.tree
+      mcmcfile = mcmc.txt
+       outfile = out.txt
+
+         ndata = 5
+       seqtype = 2    * 0: nucleotides; 1:codons; 2:AAs
+       usedata = 4    * 0: no data; 1:seq like; 2:normal approximation; 3:out.BV (in.BV); 4: approximation + MCMC
+         clock = 2    * 1: global clock; 2: independent rates; 3: correlated rates
+       RootAge = '<1.0'  * safe constraint on root age, used if no fossil for root.
+
+         model = LG    * 0:JC69, 1:K80, 2:F81, 3:F84, 4:HKY85
+         alpha = 0.5    * alpha for gamma rates at sites
+         ncatG = 5    * No. categories in discrete gamma
+
+     cleandata = 0    * remove sites with ambiguity data (1:yes, 0:no)?
+
+       BDparas = 1 1 0.1 multiplicative  * birth, death, sampling, multiplicative/conditional
+
+   rgene_gamma = 2 20 1   * gammaDir prior for rate for genes
+  sigma2_gamma = 1 10 1   * gammaDir prior for sigma^2     (for clock=2 or 3)
+
+      finetune = 1: .1 .1 .1 .1 .1 .1 * auto (0 or 1): times, musigma2, rates, mixing, paras, FossilErr
+
+         print = 1   * 0: no mcmc sample; 1: everything except branch rates 2: everything
+         mode  = dynamic
+        burnin = 0.25
+      sampfreq = 100
+       nsample = 20000
+    checkpoint = 3 0.01 mcmctree.ckpt1 * flag(0: none;  1: save;  2: resume;  3: auto-resume append) prob filename
+        n_runs = 5   * number of independent MCMC runs to run in parallel
+
+   chunk_size  = 1000
+   target_rhat = 1.01
+   target_ess  = 200
+   target_node_fraction = 0.5
+```
+
 ## New parameters
 - `n_runs` specifies the number of independent MCMC chains to perform.
 - `mode` specifies whether MCMCtree should run using the original fixed-length mode, `mode = classic`, or the new adaptive mode, `mode = dynamic`.
 - `chunk_size` specifies how many samples are collected between adaptive checks.
 - `target_rhat` specifies the maximum threshold for `R̂`. The default is `target_rhat = 1.01`.
-- `target_ess` specifies the minimum threshold for rank-normalized ESS. The default is `target_ess = 200`.
+- `target_ess` specifies the minimum threshold for `ESS`. The default is `target_ess = 200`.
 - `target_node_fraction` specifies the minimum fraction of node ages required to pass adaptive checks. The default is `target_node_fraction = 1.0`, meaning all nodes.
 
 ## Old parameters with new options
@@ -26,12 +66,11 @@ The full PAML package, maintained by Ziheng Yang, is available [here](https://gi
 - `usedata` now accepts `usedata = 4`, which provides a single-step approximate-likelihood workflow.
 - `model` now accepts amino-acid substitution models directly, for example `model = LG`, `model = WAG`, or `model = JTT`. It can also accept a path to a custom amino-acid rate matrix file.
 
+Below you can find more information of each new parameter
+
 ## Details of each new parameter
-
 ### `n_runs`
-`n_runs` specifies the number of independent MCMC chains to run.
-
-For example:
+`n_runs` specifies the number of independent MCMC chains to run. For example:
 ```text
 n_runs = 4
 ```
@@ -53,9 +92,7 @@ n_runs = 1
 When `n_runs > 1`, MCMCtree runs the chains in parallel, allowing independent chains to be run using multiple CPU cores.
 
 ### `mode`
-`mode` specifies whether MCMCtree should run in the original fixed-length mode or in the new adaptive mode.
-
-The default is:
+`mode` specifies if MCMCtree should run in the original fixed-length mode or in the new adaptive mode. The default is:
 
 ```text
 mode = classic
@@ -70,47 +107,46 @@ sampfreq = 10
 nsample = 20000
 ```
 
-Here, `burnin` is the number of burn-in iterations, `sampfreq` is the sampling frequency, and `nsample` is the number of MCMC samples collected after burn-in.
-
-To use adaptive MCMC, set:
+Here, `burnin` is the number of burn-in iterations, `sampfreq` is the sampling frequency, and `nsample` is the number of MCMC samples collected after burn-in. To use adaptive MCMC, set:
 
 ```text
 mode = dynamic
+burnin = 0.25
+sampfreq = 10
+nsample = 20000
 ```
 
-In dynamic mode, MCMCtree runs independent chains in chunks and checks convergence and ESS after each chunk.
+In the dynamic mode `burnin` is the percentage of samples that will be discarded in every convergence check.
 
 ### `chunk_size`
-`chunk_size` is used only when:
+Only used when:
 
 ```text
 mode = dynamic
 ```
 
-It specifies how many samples are collected by each chain before MCMCtree checks convergence and ESS.
-
-For example:
+It specifies how many samples are collected by each chain before MCMCtree checks `R̂` and `ESS`. For example:
 
 ```text
 chunk_size = 1000
 ```
 
-means that each chain collects 1000 samples, then MCMCtree calculates diagnostics. If the stopping criteria are not met, each chain collects another 1000 samples, and the process continues until the adaptive criteria are met or `nsample` is reached.
+means that each chain has 1000 samples collected; then MCMCtree calculates `R̂` and `ESS`. If the stopping criteria are not met, each chain has another 1000 samples collected, and the process continues until the adaptive criteria are met or `nsample` is reached.
 
-### `target_rhat
-`target_rhat` is used only when:
+### target_rhat
+Only used when:
 
 ```text
 mode = dynamic
 ```
 
-It specifies the maximum allowed `R̂` value for the monitored parameters. The default is:
+It specifies the maximum allowed `R̂` value for each parameter. The default value is:
 
 ```text
 target_rhat = 1.01
 ```
 
-Dynamic mode monitors:
+Dynamic mode checks:
 
 - node ages, `t_n*`
 - likelihood, `lnL`
@@ -118,22 +154,22 @@ Dynamic mode monitors:
 The `lnL` parameter must always pass the `R̂` threshold. For node ages, the required fraction of nodes is controlled by `target_node_fraction`.
 
 ### `target_ess`
-`target_ess` is used only when:
+Only used when:
 
 ```text
 mode = dynamic
 ```
 
-It specifies the minimum required rank-normalized effective sample size. The default is:
+It specifies the minimum required `ESS`. The default is:
 
 ```text
 target_ess = 200
 ```
 
-ESS is used for the stopping decision only for `lnL` and for the node ages that pass the `R̂` threshold. ESS values are still reported for all monitored parameters in `adaptive_stats_by_parameter.txt`.
+`ESS` is used for the stopping decision only for `lnL` and for the node ages that pass the `R̂` threshold. `ESS` values are still reported for all monitored parameters in `adaptive_stats_by_parameter.txt`.
 
 ### `target_node_fraction`
-`target_node_fraction` is used only when:
+Only used when:
 
 ```text
 mode = dynamic
@@ -153,12 +189,11 @@ target_node_fraction = 0.5
 
 means that at least 50% of node ages must pass the `R̂` threshold.
 
-The `lnL` parameter is always required to pass, independently of `target_node_fraction`.
+The `lnL` parameter is always required to pass, regardless the `target_node_fraction`.
 
+## How it works
 ### Dynamic-mode stopping rule
-In dynamic mode, MCMCtree stops only after the convergence and ESS criteria pass for three consecutive checks.
-
-A typical dynamic configuration is:
+In dynamic mode, MCMCtree stops only after the `R̂` and `ESS` criteria pass for three consecutive checks. A typical dynamic configuration has:
 
 ```text
 mode = dynamic
@@ -192,9 +227,7 @@ chunk_size = 1000
 MCMCtree can collect up to 20000 samples per chain, sampling every 10 MCMC iterations, and it will discard the first 25% of samples from each chain when calculating diagnostics and summaries.
 
 ### Dynamic-mode output files
-When using dynamic mode with multiple runs, MCMCtree keeps the individual outputs for each run and also writes combined results.
-
-Individual run directories contain files such as:
+When using dynamic mode with multiple runs, MCMCtree keeps the individual outputs for each run and also writes combined results. Individual run directories contain files such as:
 
 ```text
 run1/out.txt
@@ -219,12 +252,11 @@ adaptive_stats.txt
 adaptive_stats_by_parameter.txt
 ```
 
-`adaptive_stats.txt` gives one summary line per adaptive check. `adaptive_stats_by_parameter.txt` gives `R̂` and ESS values for each monitored parameter at each check.
+`adaptive_stats.txt` gives one summary line per adaptive check. `adaptive_stats_by_parameter.txt` gives `R̂` and `ESS` values for each monitored parameter at each check.
 
+## Details of old parameters modified
 ### `checkpoint = 3`
-`checkpoint = 3` enables automatic resume from an existing checkpoint file.
-
-If the checkpoint file is found, MCMCtree restores the chain state, keeps the existing `mcmc.txt`, and appends only the remaining samples needed to reach `nsample`. For example, if:
+`checkpoint = 3` enables automatic resume from an existing checkpoint file. If the checkpoint file is found, MCMCtree restores the chain state, keeps the existing `mcmc.txt`, and appends only the remaining samples needed to reach `nsample`. For example, if:
 
 ```text
 nsample = 20000
@@ -235,25 +267,19 @@ and the existing `mcmc.txt` already contains 15000 samples, MCMCtree will collec
 This avoids manually changing `checkpoint = 1` to `checkpoint = 2` and renaming the previous MCMC output file.
 
 ### `usedata = 4`
-`usedata = 4` provides a single-step approximate-likelihood workflow.
-
-In the original approximate-likelihood workflow, users typically had to:
+`usedata = 4` provides a single-step approximate-likelihood workflow. In the original approximate-likelihood workflow, users typically had to:
 
 1. Run MCMCtree to generate temporary control files.
 2. Run `baseml` or `codeml` separately to estimate branch lengths, gradients, and Hessian matrices.
 3. Rename or combine the resulting files into `in.BV`.
 4. Run MCMCtree again with `usedata = 2`.
 
-With `usedata = 4`, MCMCtree can generate the approximate-likelihood file and then continue directly to the MCMC analysis.
-
-For DNA data, `usedata = 4` generates the approximate-likelihood file using the selected nucleotide model and then continues with the approximate-likelihood MCMC.
+With `usedata = 4`, MCMCtree can generate the approximate-likelihood file and then continue directly to the MCMC analysis. For DNA data, `usedata = 4` generates the approximate-likelihood file using the selected nucleotide model and then continues with the approximate-likelihood MCMC.
 
 For protein data, amino-acid models can be specified directly with `model`.
 
 ### `model` for amino-acid data
-For protein data, amino-acid substitution models can be specified directly with `model`.
-
-For example:
+For protein data, amino-acid substitution models can be specified directly with `model`. For example:
 
 ```text
 seqtype = 2
@@ -276,21 +302,14 @@ model = path/to/model.dat
 
 This avoids manually editing temporary `codeml` control files only to change the amino-acid substitution model.
 
-### Approximate likelihood without a dummy alignment
-For `usedata = 2`, MCMCtree can use an existing approximate-likelihood file without requiring a dummy alignment.
-
-This makes the final approximate-likelihood MCMC step cleaner when `in.BV` has already been generated.
-
-### References for new diagnostics
-The convergence and ESS diagnostics implemented in dynamic mode follow:
-
-Vehtari A, Gelman A, Simpson D, Carpenter B, Bürkner P-C. 2021. Rank-normalization, folding, and localization: an improved Rhat for assessing convergence of MCMC. *Bayesian Analysis* 16:667-718.
-
-
 ## Notes
-This fork is intentionally not a full PAML distribution. Programs such as `yn00`, `evolver`, `pamp`, `chi2`, and `ds` have been removed from this focused repository.
+`R̂` and `ESS` diagnostics implemented in dynamic mode follow:
 
-The section below preserves the original PAML README. Please refer to it for general PAML information, including installation, documentation, input formatting, citation guidelines, and links to the official PAML Wiki.
+[Vehtari A, Gelman A, Simpson D, Carpenter B, Bürkner P-C. 2021. Rank-normalization, folding, and localization: an improved Rhat for assessing convergence of MCMC. *Bayesian Analysis* 16:667-718.](https://projecteuclid.org/journals/bayesian-analysis/volume-16/issue-2/Rank-Normalization-Folding-and-Localization--An-Improved-Rˆ-for/10.1214/20-BA1221.full)
+
+This fork is intentionally not a full PAML distribution. Programs such as `yn00`, `evolver`, `pamp`, `chi2`, and `ds` have been removed from this focused repository. The section below preserves the original PAML README. Please refer to it for general PAML information, including installation, documentation, input formatting, citation guidelines, and links to the official PAML Wiki.
+
+
 
 ---
 
